@@ -150,3 +150,17 @@ func TestCredentialProxyReplacesCredentials(t *testing.T) {
 		t.Errorf("world-readable token file: status %d, want 502", resp.StatusCode)
 	}
 }
+
+// Close must release the port before it returns, even when it races the
+// Serve goroutine's start: the next attempt binds the same port at once.
+func TestRunGatewayPortIsFreeRightAfterClose(t *testing.T) {
+	token, _ := NewToken()
+	addr := freeAddr(t)
+	for i := range 300 {
+		g, err := StartRunGateway(addr, "http://127.0.0.1:1", token, nil)
+		if err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		g.Close()
+	}
+}
