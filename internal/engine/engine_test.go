@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -24,6 +25,10 @@ type fakeExec struct {
 	calls   []string
 	cleaned []string
 	started chan string
+	// cleanupFails makes the next N Cleanup calls fail.
+	cleanupFails int
+	// keepResource skips Release, as if confirming the cleanup failed.
+	keepResource bool
 }
 
 func (f *fakeExec) Execute(ctx context.Context, job stage.Job) stage.Result {
@@ -41,6 +46,11 @@ func (f *fakeExec) Execute(ctx context.Context, job stage.Job) stage.Result {
 	f.mu.Unlock()
 	if job.Track != nil {
 		_ = job.Track("fake:" + id)
+		defer func() {
+			if !f.keepResource {
+				job.Release("fake:" + id)
+			}
+		}()
 	}
 	if f.started != nil {
 		f.started <- id
@@ -61,11 +71,15 @@ func (f *fakeExec) Execute(ctx context.Context, job stage.Job) stage.Result {
 	panic("unknown step " + step)
 }
 
-func (f *fakeExec) Cleanup(_ context.Context, resource string) error {
+func (f *fakeExec) Cleanup(_ context.Context, resource string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cleaned = append(f.cleaned, resource)
-	return nil
+	if f.cleanupFails > 0 {
+		f.cleanupFails--
+		return false, errors.New("sandboxd unavailable")
+	}
+	return true, nil
 }
 
 func (f *fakeExec) callCount(id string) int {
@@ -355,7 +369,7 @@ func TestRecoverParksCrashedAttemptAndCleansItsResource(t *testing.T) {
 	if err := h.eng.Store.StartAttempt(ctx, st, store.Attempt{RunID: id, StageID: "a", Attempt: 1, LogPath: "x", StartedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.eng.Store.SetAttemptResource(ctx, id, "a", 1, "fake:crashed"); err != nil {
+	if err := h.eng.Store.TrackResource(ctx, id, "a", 1, "fake:crashed", now); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.eng.Recover(ctx); err != nil {
@@ -496,5 +510,145 @@ func TestEnvFileMustBePrivate(t *testing.T) {
 	writeFile(t, path, "A=1\n", 0o644)
 	if _, err := ReadEnvFile(path); err == nil {
 		t.Error("world-readable env_file accepted")
+	}
+}
+
+func pendingResources(t *testing.T, h *harness) []string {
+	t.Helper()
+	p, err := h.eng.Store.PendingCleanups(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, c := range p {
+		out = append(out, c.Resource)
+	}
+	return out
+}
+
+func TestReleasedResourceIsNotCleanedAgain(t *testing.T) {
+	h := newHarness(t, nil)
+	h.add("name: p\nstages:\n  - {id: a, cmd: x}\n", false)
+	h.runToEnd(h.start("p"))
+	if got := pendingResources(t, h); len(got) != 0 {
+		t.Fatalf("pending after a clean attempt: %v", got)
+	}
+	if err := h.eng.SweepCleanups(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.ex.cleaned) != 0 {
+		t.Errorf("swept a released resource: %v", h.ex.cleaned)
+	}
+}
+
+// An attempt that finished without confirming its resource is gone (for
+// example a sandbox DELETE that returned 503) keeps a pending cleanup that is
+// retried until it succeeds, even though the attempt itself succeeded.
+func TestUnconfirmedCleanupIsRetriedUntilDone(t *testing.T) {
+	h := newHarness(t, nil)
+	h.ex.keepResource = true
+	h.ex.cleanupFails = 1
+	h.add("name: p\nstages:\n  - {id: a, cmd: x}\n", false)
+	d := h.runToEnd(h.start("p"))
+	if d.State != store.RunSucceeded {
+		t.Fatalf("run %s", d.State)
+	}
+	// runToEnd's final sweep tried once and failed.
+	if got := pendingResources(t, h); !slices.Equal(got, []string{"fake:a"}) {
+		t.Fatalf("pending %v, want [fake:a] kept after a failed cleanup", got)
+	}
+	if err := h.eng.SweepCleanups(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := pendingResources(t, h); len(got) != 0 {
+		t.Fatalf("pending %v after a successful retry", got)
+	}
+	if !slices.Equal(h.ex.cleaned, []string{"fake:a", "fake:a"}) {
+		t.Errorf("cleanup calls %v, want two tries", h.ex.cleaned)
+	}
+}
+
+func TestSweepLeavesRunningAttemptsAlone(t *testing.T) {
+	h := newHarness(t, map[string][]string{"a": {"hang"}})
+	h.ex.started = make(chan string, 1)
+	h.add("name: p\nstages:\n  - {id: a, cmd: x}\n", false)
+	id := h.start("p")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.eng.Loop(ctx, LoopOptions{Only: map[int64]bool{id: true}})
+	<-h.ex.started
+	if err := h.eng.SweepCleanups(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	h.ex.mu.Lock()
+	cleaned := slices.Clone(h.ex.cleaned)
+	h.ex.mu.Unlock()
+	if len(cleaned) != 0 {
+		t.Errorf("sweep cleaned a running attempt's resource: %v", cleaned)
+	}
+}
+
+// SIGTERM while an upstream stage has just succeeded: the shutdown fold must
+// not start its dependent. The run stays running for the next runner.
+func TestShutdownStartsNoNewStage(t *testing.T) {
+	h := newHarness(t, nil)
+	h.add("name: p\nstages:\n  - {id: a, cmd: x}\n  - {id: b, cmd: x, needs: [a]}\n", false)
+	id := h.start("p")
+	ctx := context.Background()
+	// Attempt of a finished but not folded yet, as at the moment SIGTERM lands.
+	stages, _ := h.eng.Store.ListStages(ctx, id)
+	st := stages[0]
+	st.Attempts = 1
+	now := h.now
+	st.StartedAt = &now
+	if err := h.eng.Store.StartAttempt(ctx, st, store.Attempt{RunID: id, StageID: "a", Attempt: 1, LogPath: "x", StartedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	code := 0
+	if err := h.eng.Store.FinishAttempt(ctx, store.Attempt{RunID: id, StageID: "a", Attempt: 1, State: store.AttemptSucceeded, ExitCode: &code, FinishedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	h.eng.stopAll(nil)
+	if n := h.ex.callCount("b"); n != 0 {
+		t.Fatalf("shutdown started b (%d calls)", n)
+	}
+	d, _ := h.eng.Run(ctx, id)
+	if d.State != store.RunRunning {
+		t.Fatalf("run %s; want it left running for the next runner", d.State)
+	}
+	assertStates(t, d, map[string]string{"a": "succeeded", "b": "pending"})
+	// The next runner continues it.
+	if d := h.runToEnd(id); d.State != store.RunSucceeded {
+		t.Fatalf("next runner: %s", d.State)
+	}
+}
+
+func TestStatusShowsResumedOlderRunAsActive(t *testing.T) {
+	h := newHarness(t, map[string][]string{"a": {"fail", "ok", "hang"}})
+	h.add("name: p\nstages:\n  - {id: a, cmd: x}\n", false)
+	old := h.start("p")
+	h.runToEnd(old) // fails
+	newer := h.start("p")
+	h.runToEnd(newer) // succeeds
+	if err := h.eng.Resume(context.Background(), old, ""); err != nil {
+		t.Fatal(err)
+	}
+	st, err := h.eng.Status(context.Background(), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := st.Pipelines[0]
+	if p.ActiveRunID == nil || *p.ActiveRunID != old {
+		t.Fatalf("active_run_id %v, want %d (the resumed run)", p.ActiveRunID, old)
+	}
+	if p.LastRun.ID != newer {
+		t.Errorf("last_run %d, want %d", p.LastRun.ID, newer)
+	}
+}
+
+func TestScheduleJSONUsesDocumentedKeys(t *testing.T) {
+	raw, _ := json.Marshal(spec.Schedule{Interval: "1h", Jitter: "5m"})
+	if string(raw) != `{"interval":"1h","jitter":"5m"}` {
+		t.Errorf("schedule JSON %s", raw)
 	}
 }

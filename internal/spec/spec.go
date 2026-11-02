@@ -44,6 +44,12 @@ const MaxRetry = 10
 // MinInterval stops a schedule from hot-looping.
 const MinInterval = time.Minute
 
+// MinAtYear and MaxAtYear bound schedule.at.
+const (
+	MinAtYear = 2000
+	MaxAtYear = 2200
+)
+
 // DefaultAgentTools are the omp tools an agent stage gets when tools is unset:
 // read (local files inside the sandbox and URL fetch) and web search. No tool
 // that writes or executes is ever allowed.
@@ -70,9 +76,9 @@ type Spec struct {
 // example a fixed weekday and hour); without it a freshly enabled pipeline runs
 // at once and then every Interval. Missed slots collapse into one run.
 type Schedule struct {
-	Interval string `yaml:"interval"`
-	Jitter   string `yaml:"jitter,omitempty"`
-	At       string `yaml:"at,omitempty"`
+	Interval string `yaml:"interval" json:"interval"`
+	Jitter   string `yaml:"jitter,omitempty" json:"jitter,omitempty"`
+	At       string `yaml:"at,omitempty" json:"at,omitempty"`
 }
 
 // Stage is one node of the DAG. Exactly one of Cmd (shell) or Agent is set.
@@ -236,8 +242,13 @@ func (sc Schedule) validate() error {
 		}
 	}
 	if sc.At != "" {
-		if _, err := time.Parse(time.RFC3339, sc.At); err != nil {
+		at, err := time.Parse(time.RFC3339, sc.At)
+		if err != nil {
 			return fmt.Errorf("at %q: use RFC 3339, e.g. 2026-11-08T03:00:00+01:00", sc.At)
+		}
+		// Bounded so slot arithmetic stays far from time.Duration's ±292y.
+		if at.Year() < MinAtYear || at.Year() > MaxAtYear {
+			return fmt.Errorf("at %q: the year must be between %d and %d", sc.At, MinAtYear, MaxAtYear)
 		}
 	}
 	return nil
@@ -321,6 +332,9 @@ func (st Stage) validateAgent() []error {
 	for _, in := range st.Inputs {
 		if err := validFileName(in); err != nil {
 			add("inputs: %v", err)
+		}
+		if in == st.Output {
+			add("output %q is also an input; the runner replaces output, so give it its own name", in)
 		}
 	}
 	if st.Timeout == "" {

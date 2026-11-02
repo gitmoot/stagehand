@@ -10,11 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/gitmoot/stagehand/internal/procgroup"
 	"github.com/gitmoot/stagehand/internal/stage"
 )
 
@@ -48,63 +48,58 @@ func (e Executor) Execute(ctx context.Context, job stage.Job) stage.Result {
 	if dir == "" {
 		dir = job.WorkDir
 	}
-	sh := e.Shell
-	if sh == "" {
-		sh = "/bin/sh"
-	}
-	cmd := exec.Command(sh, "-c", job.Stage.Cmd)
+	cmd := procgroup.Shell(e.Shell, job.Stage.Cmd)
 	cmd.Dir = dir
 	cmd.Env = job.Env
 	cmd.Stdin = nil // /dev/null
 	cmd.Stdout = logf
 	cmd.Stderr = logf
-	// Own process group so timeout and cancel reach every child. The group is
-	// recorded before work starts; if the runner crashes, recovery kills it
-	// (see Cleanup).
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	if err := cmd.Start(); err != nil {
+	// The stage's own process group, held at the gate until it is recorded,
+	// so a crash at any point leaves either nothing running or a recorded
+	// group recovery can kill.
+	p, err := procgroup.Start(cmd)
+	if err != nil {
 		return stage.Result{Outcome: stage.Failed, Summary: "start: " + err.Error()}
 	}
-	pgid := cmd.Process.Pid
-	if job.Track != nil {
-		resource := ProcessResource(pgid)
-		if err := job.Track(resource); err != nil {
-			_ = syscall.Kill(-pgid, syscall.SIGKILL)
-			_ = cmd.Wait()
-			return stage.Result{Outcome: stage.Failed, Summary: "record process: " + err.Error()}
+	resource := ProcessResource(p.PGID)
+	if err := procgroup.Record(ctx, job.Track, resource); err != nil {
+		p.Abort()
+		_, _ = p.Finish()
+		if job.Release != nil {
+			job.Release(resource)
 		}
+		if ctx.Err() != nil {
+			return stage.Result{Outcome: stage.Failed, Summary: contextSummary(ctx)}
+		}
+		return stage.Result{Outcome: stage.Failed, Summary: "record process: " + err.Error()}
+	}
+	if err := p.Open(); err != nil {
+		p.Abort()
 	}
 
-	waitErr := make(chan error, 1)
-	go func() { waitErr <- cmd.Wait() }()
-
-	var runErr error
 	select {
-	case runErr = <-waitErr:
+	case <-p.Exited():
 	case <-ctx.Done():
-		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		p.Signal(syscall.SIGTERM)
 		select {
-		case runErr = <-waitErr:
+		case <-p.Exited():
 		case <-time.After(KillGrace):
-			_ = syscall.Kill(-pgid, syscall.SIGKILL)
-			runErr = <-waitErr
+			p.Signal(syscall.SIGKILL)
 		}
 	}
-	// Sweep anything the command left behind in its group.
-	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	// Finish kills anything the command left in its group (while the leader
+	// is still an unreaped zombie, so the group id cannot be reused), then
+	// reaps it. Nothing remains to clean up after that.
+	code, waitErr := p.Finish()
+	if job.Release != nil {
+		job.Release(resource)
+	}
 
 	if ctx.Err() != nil {
 		return stage.Result{Outcome: stage.Failed, Summary: contextSummary(ctx)}
 	}
-
-	code := 0
-	if runErr != nil {
-		var exitErr *exec.ExitError
-		if !errors.As(runErr, &exitErr) {
-			return stage.Result{Outcome: stage.Failed, Summary: "wait: " + runErr.Error()}
-		}
-		code = exitErr.ExitCode()
+	if waitErr != nil {
+		return stage.Result{Outcome: stage.Failed, Summary: "wait: " + waitErr.Error()}
 	}
 	res := stage.Result{ExitCode: &code}
 

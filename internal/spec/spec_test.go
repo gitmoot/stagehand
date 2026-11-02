@@ -72,6 +72,8 @@ func TestInvalidSpecs(t *testing.T) {
 		{"agent env", "name: p\nstages:\n  - {id: a, agent: omp, prompt: x, output: o.json, max_cost: 1, timeout: 1m, env_keys: [A]}\n", "no environment"},
 		{"output path", "name: p\nstages:\n  - {id: a, agent: omp, prompt: x, output: ../o.json, max_cost: 1, timeout: 1m}\n", "plain file name"},
 		{"two prompts", "name: p\nstages:\n  - {id: a, agent: omp, prompt: x, prompt_file: y, output: o.json, max_cost: 1, timeout: 1m}\n", "exactly one"},
+		{"output is an input", "name: p\nstages:\n  - {id: a, agent: omp, prompt: x, inputs: [rows.json], output: rows.json, max_cost: 1, timeout: 1m}\n", "also an input"},
+		{"ancient anchor", "name: p\nschedule: {interval: 1h, at: '1700-01-01T00:00:00Z'}\nstages:\n  - {id: a, cmd: x}\n", "between 2000"},
 		{"other agent", "name: p\nstages:\n  - {id: a, agent: codex, prompt: x, output: o.json, max_cost: 1, timeout: 1m}\n", "only \"omp\""},
 	}
 	for _, c := range cases {

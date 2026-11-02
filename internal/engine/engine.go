@@ -15,6 +15,7 @@ import (
 	"math/rand/v2"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gitmoot/stagehand/internal/spec"
@@ -48,6 +49,12 @@ type Engine struct {
 
 	mu       sync.Mutex
 	inflight map[flightKey]context.CancelCauseFunc
+	// liveResources are tracked by attempts still running in this process;
+	// the cleanup sweep leaves them alone.
+	liveResources map[string]bool
+	// stopping is set once Loop is shutting down; advance then only folds
+	// results and never starts a stage.
+	stopping atomic.Bool
 	wake     chan struct{}
 	wg       sync.WaitGroup
 }
@@ -63,16 +70,17 @@ func New(st *store.Store, home string, executors map[spec.Kind]stage.Executor, b
 		log = slog.New(slog.DiscardHandler)
 	}
 	return &Engine{
-		Store:     st,
-		Home:      home,
-		Executors: executors,
-		BaseEnv:   baseEnv,
-		Now:       time.Now,
-		Jitter:    defaultJitter,
-		Log:       log,
-		Poll:      DefaultPoll,
-		inflight:  map[flightKey]context.CancelCauseFunc{},
-		wake:      make(chan struct{}, 1),
+		Store:         st,
+		Home:          home,
+		Executors:     executors,
+		BaseEnv:       baseEnv,
+		Now:           time.Now,
+		Jitter:        defaultJitter,
+		Log:           log,
+		Poll:          DefaultPoll,
+		inflight:      map[flightKey]context.CancelCauseFunc{},
+		liveResources: map[string]bool{},
+		wake:          make(chan struct{}, 1),
 	}
 }
 
@@ -261,24 +269,19 @@ func (e *Engine) Cancel(ctx context.Context, runID int64) error {
 
 // ---- execution (lock holder only) ----
 
+// CleanupInterval is how often Loop retries pending cleanups.
+const CleanupInterval = time.Minute
+
 // Recover finishes attempts a previous process left running: they become
-// interrupted (the next advance parks their run), and whatever they started
-// (process groups, sandboxes) is stopped. Call it once after taking the lock, before Loop.
+// interrupted (the next advance parks their run). It then sweeps pending
+// cleanups, stopping whatever earlier attempts started (process groups,
+// sandboxes). Call it once after taking the lock, before Loop.
 func (e *Engine) Recover(ctx context.Context) error {
 	attempts, err := e.Store.RunningAttempts(ctx)
 	if err != nil {
 		return err
 	}
 	for _, a := range attempts {
-		if a.Resource != "" {
-			for kind, ex := range e.Executors {
-				if c, ok := ex.(stage.Cleaner); ok {
-					if err := c.Cleanup(ctx, a.Resource); err != nil {
-						e.Log.Error("stop interrupted attempt", "executor", kind, "resource", a.Resource, "err", err)
-					}
-				}
-			}
-		}
 		now := e.now()
 		a.State = store.AttemptInterrupted
 		a.Summary = "interrupted: the runner stopped while this stage ran"
@@ -287,6 +290,51 @@ func (e *Engine) Recover(ctx context.Context) error {
 			return err
 		}
 		e.Log.Warn("recovered interrupted attempt", "run", a.RunID, "stage", a.StageID, "attempt", a.Attempt)
+	}
+	return e.SweepCleanups(ctx)
+}
+
+// SweepCleanups offers every pending cleanup that no running attempt owns to
+// every Cleaner, and forgets the ones confirmed gone. Failures stay pending
+// and are retried on the next sweep.
+func (e *Engine) SweepCleanups(ctx context.Context) error {
+	pending, err := e.Store.PendingCleanups(ctx)
+	if err != nil {
+		return err
+	}
+	for _, p := range pending {
+		e.mu.Lock()
+		owned := e.liveResources[p.Resource]
+		e.mu.Unlock()
+		if owned {
+			continue
+		}
+		done := false
+		var errs []error
+		for kind, ex := range e.Executors {
+			c, ok := ex.(stage.Cleaner)
+			if !ok {
+				continue
+			}
+			d, err := c.Cleanup(ctx, p.Resource)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", kind, err))
+			}
+			done = done || d
+		}
+		switch {
+		case done:
+			if err := e.Store.ReleaseResource(ctx, p.Resource); err != nil {
+				return err
+			}
+			e.Log.Info("cleaned up", "resource", p.Resource, "run", p.RunID, "stage", p.StageID)
+		case len(errs) > 0:
+			msg := errors.Join(errs...).Error()
+			e.Log.Error("cleanup failed; will retry", "resource", p.Resource, "run", p.RunID, "stage", p.StageID, "tries", p.Tries+1, "err", msg)
+			if err := e.Store.NoteCleanupFailure(ctx, p.Resource, msg); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -302,13 +350,15 @@ type LoopOptions struct {
 }
 
 // Loop advances runs until ctx is done (or, with UntilIdle, until the
-// selected runs have settled). When ctx ends, running stages are stopped and
-// their runs parked as interrupted.
+// selected runs have settled). It retries pending cleanups every
+// CleanupInterval. When ctx ends, running stages are stopped and their runs
+// parked as interrupted.
 func (e *Engine) Loop(ctx context.Context, opts LoopOptions) error {
 	poll := e.Poll
 	if poll <= 0 {
 		poll = DefaultPoll
 	}
+	lastSweep := time.Now()
 	for {
 		if opts.Schedule {
 			if err := e.schedule(ctx); err != nil && ctx.Err() == nil {
@@ -318,6 +368,12 @@ func (e *Engine) Loop(ctx context.Context, opts LoopOptions) error {
 		busy, err := e.advanceAll(ctx, opts.Only)
 		if err != nil && ctx.Err() == nil {
 			e.Log.Error("advance", "err", err)
+		}
+		if time.Since(lastSweep) >= CleanupInterval || (opts.UntilIdle && !busy) {
+			if serr := e.SweepCleanups(ctx); serr != nil && ctx.Err() == nil {
+				e.Log.Error("cleanup sweep", "err", serr)
+			}
+			lastSweep = time.Now()
 		}
 		if opts.UntilIdle && !busy && err == nil {
 			return nil
@@ -335,6 +391,8 @@ func (e *Engine) Loop(ctx context.Context, opts LoopOptions) error {
 // stopAll interrupts every running stage, waits for them, and folds the
 // results so their runs are parked rather than left running.
 func (e *Engine) stopAll(only map[int64]bool) {
+	e.stopping.Store(true)
+	defer e.stopping.Store(false)
 	e.mu.Lock()
 	for _, cancel := range e.inflight {
 		cancel(errStopping)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -140,6 +141,11 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 		if !ready {
 			continue
 		}
+		if e.stopping.Load() {
+			// Shutting down: start nothing. The run stays running and the
+			// next runner picks it up from here.
+			return true, nil
+		}
 		if err := e.start(ctx, run, sp, stg, st); err != nil {
 			return true, err
 		}
@@ -245,11 +251,21 @@ func (e *Engine) start(ctx context.Context, run store.Run, sp spec.Spec, stg spe
 			return fail(err.Error())
 		}
 	}
+	var tracked []string // guarded by e.mu
 	job := stage.Job{
 		RunID: run.ID, Pipeline: run.Pipeline, Stage: stg, Attempt: st.Attempts,
 		WorkDir: workDir, LogPath: logPath, ResultPath: resultPath, SourceDir: run.SourceDir, Env: env,
 		Track: func(resource string) error {
-			return e.Store.SetAttemptResource(context.Background(), run.ID, stg.ID, a.Attempt, resource)
+			e.mu.Lock()
+			e.liveResources[resource] = true
+			tracked = append(tracked, resource)
+			e.mu.Unlock()
+			return e.Store.TrackResource(context.Background(), run.ID, stg.ID, a.Attempt, resource, e.now())
+		},
+		Release: func(resource string) {
+			if err := e.Store.ReleaseResource(context.Background(), resource); err != nil {
+				e.Log.Error("release resource; the cleanup sweep will retry it", "resource", resource, "err", err)
+			}
 		},
 	}
 
@@ -302,6 +318,9 @@ func (e *Engine) start(ctx context.Context, run store.Run, sp spec.Spec, stg spe
 
 		e.mu.Lock()
 		delete(e.inflight, key)
+		for _, r := range tracked {
+			delete(e.liveResources, r)
+		}
 		e.mu.Unlock()
 		e.signal()
 	}()
@@ -422,7 +441,13 @@ func nextSlot(at time.Time, interval time.Duration, now time.Time) time.Time {
 	if now.Before(at) {
 		return at
 	}
-	k := now.Sub(at)/interval + 1
+	diff := now.Sub(at)
+	// Validation keeps `at` within 2000–2200, so this only trips on a broken
+	// clock; never return a time that is not in the future.
+	if diff >= time.Duration(math.MaxInt64)-interval {
+		return now.Add(interval)
+	}
+	k := diff/interval + 1
 	return at.Add(k * interval)
 }
 

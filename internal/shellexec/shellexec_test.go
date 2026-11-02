@@ -118,16 +118,16 @@ func TestCleanupKillsRecordedGroupOnly(t *testing.T) {
 	// A resource whose start time does not match must be left alone.
 	pidPart := strings.TrimPrefix(resource, "process:")
 	pidText, _, _ := strings.Cut(pidPart, "@")
-	if err := (Executor{}).Cleanup(context.Background(), "process:"+pidText+"@1"); err != nil {
-		t.Fatal(err)
+	if done, err := (Executor{}).Cleanup(context.Background(), "process:"+pidText+"@1"); err != nil || !done {
+		t.Fatalf("mismatched start time: done=%v err=%v; a reused pid means the group is already gone", done, err)
 	}
 	select {
 	case <-done:
 		t.Fatal("cleanup killed a group whose start time did not match")
 	case <-time.After(200 * time.Millisecond):
 	}
-	if err := (Executor{}).Cleanup(context.Background(), resource); err != nil {
-		t.Fatal(err)
+	if done, err := (Executor{}).Cleanup(context.Background(), resource); err != nil || !done {
+		t.Fatalf("done=%v err=%v", done, err)
 	}
 	select {
 	case res := <-done:
@@ -139,4 +139,32 @@ func TestCleanupKillsRecordedGroupOnly(t *testing.T) {
 		t.Fatal("cleanup did not kill the recorded group")
 	}
 	cancel()
+}
+
+// The command must not run until its process group is durably recorded, and
+// a cancel during a slow record must still stop the stage.
+func TestCommandWaitsForTrackingAndCancelStillWorks(t *testing.T) {
+	j := job(t, `touch "$PWD/ran"`)
+	release := make(chan struct{})
+	j.Track = func(string) error { <-release; return nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan stage.Result, 1)
+	go func() { done <- Executor{}.Execute(ctx, j) }()
+	time.Sleep(300 * time.Millisecond)
+	if _, err := os.Stat(filepath.Join(j.WorkDir, "ran")); err == nil {
+		t.Fatal("command ran before its process group was recorded")
+	}
+	cancel()
+	select {
+	case res := <-done:
+		if res.Outcome != stage.Failed {
+			t.Errorf("%+v", res)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancel did not interrupt a stuck record")
+	}
+	close(release)
+	if _, err := os.Stat(filepath.Join(j.WorkDir, "ran")); err == nil {
+		t.Fatal("command ran although recording never finished")
+	}
 }

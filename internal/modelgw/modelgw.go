@@ -90,6 +90,7 @@ type RunGateway struct {
 	token  string
 	srv    *http.Server
 	ln     net.Listener
+	done   chan struct{} // closed when Serve returns
 	served atomic.Int64
 }
 
@@ -127,19 +128,31 @@ func StartRunGateway(listen, upstream, token string, log *slog.Logger) (*RunGate
 			proxy.ServeHTTP(w, r)
 		}),
 	}
-	go func() { _ = g.srv.Serve(ln) }()
+	g.done = make(chan struct{})
+	go func() {
+		defer close(g.done)
+		_ = g.srv.Serve(ln)
+	}()
 	return g, nil
 }
 
 // Requests is how many authorized requests were forwarded.
 func (g *RunGateway) Requests() int64 { return g.served.Load() }
 
-// Close stops the listener and cuts open streams.
+// Close releases the port before it returns, then drains open requests for
+// up to 2s and cuts the rest. Closing the listener directly (instead of only
+// Shutdown) matters: Shutdown does not close a listener that Serve has not
+// registered yet, which would leave the port bound after Close.
 func (g *RunGateway) Close() error {
+	lnErr := g.ln.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := g.srv.Shutdown(ctx); err != nil {
-		return g.srv.Close()
+		_ = g.srv.Close()
+	}
+	<-g.done
+	if lnErr != nil && !errors.Is(lnErr, net.ErrClosed) {
+		return lnErr
 	}
 	return nil
 }

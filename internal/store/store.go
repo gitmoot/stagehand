@@ -144,7 +144,16 @@ var migrations = []string{
 		finished_at   TEXT,
 		PRIMARY KEY (run_id, stage_id, attempt)
 	);
-	CREATE INDEX stage_attempts_state ON stage_attempts(state);`,
+	CREATE INDEX stage_attempts_state ON stage_attempts(state);
+	CREATE TABLE pending_cleanups (
+		resource    TEXT PRIMARY KEY,
+		run_id      INTEGER NOT NULL,
+		stage_id    TEXT NOT NULL,
+		attempt     INTEGER NOT NULL,
+		recorded_at TEXT NOT NULL,
+		tries       INTEGER NOT NULL DEFAULT 0,
+		last_error  TEXT NOT NULL DEFAULT ''
+	);`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -441,9 +450,19 @@ func (s *Store) LastRun(ctx context.Context, pipeline string) (*Run, error) {
 
 // HasActiveRun reports whether the pipeline has a running run.
 func (s *Store) HasActiveRun(ctx context.Context, pipeline string) (bool, error) {
-	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE pipeline=? AND state=?`, pipeline, RunRunning).Scan(&n)
-	return n > 0, err
+	id, err := s.ActiveRunID(ctx, pipeline)
+	return id != 0, err
+}
+
+// ActiveRunID is the id of the pipeline's running run, or 0. It may be older
+// than the newest run (a resumed run keeps its id).
+func (s *Store) ActiveRunID(ctx context.Context, pipeline string) (int64, error) {
+	var id int64
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM runs WHERE pipeline=? AND state=?`, pipeline, RunRunning).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return id, err
 }
 
 // FinishRun records a run's terminal state.
@@ -588,11 +607,69 @@ func (s *Store) StartAttempt(ctx context.Context, st RunStage, a Attempt) error 
 	return tx.Commit()
 }
 
-// SetAttemptResource records what an attempt started (a process group or a
-// sandbox) as soon as it exists, so a crash can still find and stop it.
-func (s *Store) SetAttemptResource(ctx context.Context, runID int64, stageID string, attempt int, resource string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE stage_attempts SET resource=? WHERE run_id=? AND stage_id=? AND attempt=?`, resource, runID, stageID, attempt)
-	return expectOne(res, err, "attempt")
+// TrackResource records what an attempt starts outside the runner (a process
+// group, a sandbox) on the attempt row and as a pending cleanup, atomically.
+// The pending cleanup stays until ReleaseResource.
+func (s *Store) TrackResource(ctx context.Context, runID int64, stageID string, attempt int, resource string, at time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE stage_attempts SET resource=? WHERE run_id=? AND stage_id=? AND attempt=?`, resource, runID, stageID, attempt)
+	if err := expectOne(res, err, "attempt"); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO pending_cleanups (resource, run_id, stage_id, attempt, recorded_at) VALUES (?,?,?,?,?)
+		ON CONFLICT(resource) DO NOTHING`, resource, runID, stageID, attempt, fmtTime(at)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ReleaseResource forgets a pending cleanup.
+func (s *Store) ReleaseResource(ctx context.Context, resource string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM pending_cleanups WHERE resource=?`, resource)
+	return err
+}
+
+// PendingCleanup is a resource not yet confirmed gone.
+type PendingCleanup struct {
+	Resource   string
+	RunID      int64
+	StageID    string
+	Attempt    int
+	RecordedAt time.Time
+	Tries      int
+	LastError  string
+}
+
+// PendingCleanups lists resources not yet confirmed gone, oldest first.
+func (s *Store) PendingCleanups(ctx context.Context) ([]PendingCleanup, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT resource, run_id, stage_id, attempt, recorded_at, tries, last_error FROM pending_cleanups ORDER BY recorded_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingCleanup
+	for rows.Next() {
+		var p PendingCleanup
+		var at string
+		if err := rows.Scan(&p.Resource, &p.RunID, &p.StageID, &p.Attempt, &at, &p.Tries, &p.LastError); err != nil {
+			return nil, err
+		}
+		if p.RecordedAt, err = parseTime(at); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// NoteCleanupFailure records a failed cleanup try.
+func (s *Store) NoteCleanupFailure(ctx context.Context, resource, msg string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE pending_cleanups SET tries=tries+1, last_error=? WHERE resource=?`, msg, resource)
+	return err
 }
 
 // FinishAttempt records an attempt's outcome. It only changes a running

@@ -28,9 +28,11 @@ type Request struct {
 	Files map[string][]byte
 	// Args are omp's arguments, without the binary.
 	Args []string
-	// Track records an external resource (process group, sandbox) before
-	// omp starts, so a crashed runner can stop it.
-	Track func(resource string) error
+	// Track and Release are the attempt's resource record (see
+	// stage.Job): Track before starting anything outside the runner,
+	// Release once it is confirmed gone.
+	Track   func(resource string) error
+	Release func(resource string)
 	// Stderr receives omp's stderr and backend diagnostics.
 	Stderr io.Writer
 }
@@ -74,12 +76,6 @@ func (x Executor) Execute(ctx context.Context, job stage.Job) stage.Result {
 		return stage.Result{Outcome: stage.Failed, Summary: msg}
 	}
 
-	outPath := filepath.Join(job.WorkDir, st.Output)
-	// A stale output from an earlier attempt must never pass for this one.
-	if err := os.Remove(outPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fail("remove old output: %v", err)
-	}
-
 	prompt, err := buildPrompt(job)
 	if err != nil {
 		return fail("%v", err)
@@ -91,6 +87,12 @@ func (x Executor) Execute(ctx context.Context, job stage.Job) stage.Result {
 			return fail("input %s: %v (an earlier stage must write it to $STAGEHAND_WORK)", name, err)
 		}
 		files[name] = raw
+	}
+	// Inputs are read first, so removing the output can never destroy one.
+	// A stale output from an earlier attempt must never pass for this one.
+	outPath := filepath.Join(job.WorkDir, st.Output)
+	if err := os.Remove(outPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fail("remove old output: %v", err)
 	}
 	maxTime := time.Duration(0)
 	if deadline, ok := ctx.Deadline(); ok {
@@ -118,7 +120,7 @@ func (x Executor) Execute(ctx context.Context, job stage.Job) stage.Result {
 			cancel(errOverBudget{spent: spent, limit: st.MaxCost})
 		}
 	}
-	exitCode, runErr := x.Backend.Run(runCtx, Request{Files: files, Args: args, Track: job.Track, Stderr: logf}, onLine)
+	exitCode, runErr := x.Backend.Run(runCtx, Request{Files: files, Args: args, Track: job.Track, Release: job.Release, Stderr: logf}, onLine)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -173,11 +175,11 @@ func (x Executor) Execute(ctx context.Context, job stage.Job) stage.Result {
 }
 
 // Cleanup forwards crash recovery to the backend, if it starts anything.
-func (x Executor) Cleanup(ctx context.Context, resource string) error {
+func (x Executor) Cleanup(ctx context.Context, resource string) (bool, error) {
 	if c, ok := x.Backend.(stage.Cleaner); ok {
 		return c.Cleanup(ctx, resource)
 	}
-	return nil
+	return false, nil
 }
 
 // buildPrompt is the stage prompt plus the runner's contract: which input

@@ -20,28 +20,30 @@ func ProcessResource(pgid int) string {
 }
 
 // Cleanup kills a process group recorded by ProcessResource if its leader is
-// still the same process. Other resources are ignored.
-func (Executor) Cleanup(_ context.Context, resource string) error {
+// still the same process, and reports it done. Other resources are not its
+// concern (done=false).
+func (Executor) Cleanup(_ context.Context, resource string) (bool, error) {
 	rest, ok := strings.CutPrefix(resource, processPrefix)
 	if !ok {
-		return nil
+		return false, nil
 	}
 	pidText, start, _ := strings.Cut(rest, "@")
 	pgid, err := strconv.Atoi(pidText)
 	if err != nil || pgid <= 1 {
-		return fmt.Errorf("bad process resource %q", resource)
+		// Unparseable: nothing can be done with it, so forget it.
+		return true, fmt.Errorf("bad process resource %q", resource)
 	}
 	// Kill only while the leader is the process we started: a reused pid has
 	// a different start time. A group whose leader already exited is left
 	// alone (it cannot be told apart from a new group with the same id); under
 	// systemd the unit's cgroup is killed with the runner anyway.
 	if start == "" || startTime(pgid) != start {
-		return nil
+		return true, nil
 	}
 	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return err
+		return false, err
 	}
-	return nil
+	return true, nil
 }
 
 // startTime is field 22 of /proc/<pid>/stat, or "" if unavailable.

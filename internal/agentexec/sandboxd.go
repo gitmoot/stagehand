@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,8 +21,9 @@ const (
 	guestHome     = "/home/user"
 	guestWork     = guestHome + "/work"
 	guestAgentDir = guestHome + "/.stagehand/agent"
-	// sandboxPrefix marks a tracked resource as a sandboxd VM.
-	sandboxPrefix = "sandboxd:"
+	// sandboxJobPrefix marks a tracked resource as the sandboxd job id a VM
+	// is created under.
+	sandboxJobPrefix = "sandboxd-job:"
 )
 
 // Sandboxd runs omp in a fresh sandboxd Firecracker VM per attempt. The VM
@@ -69,33 +71,43 @@ func (s Sandboxd) Run(ctx context.Context, req Request, onLine func([]byte)) (in
 			ttl = left
 		}
 	}
-	jobID := make([]byte, 12)
-	if _, err := rand.Read(jobID); err != nil {
+	jobBytes := make([]byte, 12)
+	if _, err := rand.Read(jobBytes); err != nil {
 		return 0, err
 	}
+	jobID := "stagehand-" + hex.EncodeToString(jobBytes)
+	resource := sandboxJobPrefix + jobID
+	// Record the job id BEFORE asking for a VM: if the create response is
+	// lost, or the runner dies mid-create, cleanup finds the VM by its
+	// metadata.
+	if req.Track != nil {
+		if err := req.Track(resource); err != nil {
+			return 0, fmt.Errorf("record sandbox job: %w", err)
+		}
+	}
+	// However Run ends, destroy whatever was created under jobID, confirm it
+	// is gone, and only then release the record. A failure leaves it for the
+	// engine's cleanup sweep.
+	defer func() {
+		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+		defer cancel()
+		done, err := s.destroyJob(dctx, jobID)
+		switch {
+		case done && req.Release != nil:
+			req.Release(resource)
+		case !done && s.Log != nil:
+			s.Log.Error("sandbox not confirmed destroyed; the cleanup sweep will retry", "job", jobID, "err", err)
+		}
+	}()
 	sb, err := s.Client.Create(ctx, sandboxd.CreateRequest{
 		TemplateID: s.Template,
 		Timeout:    ttl,
 		Metadata: map[string]string{
-			"job_id": "stagehand-" + hex.EncodeToString(jobID), "attempt": "1", "lifecycle_generation": "0",
-			"owner": "stagehand",
+			"job_id": jobID, "attempt": "1", "lifecycle_generation": "0", "owner": "stagehand",
 		},
 	})
 	if err != nil {
 		return 0, err
-	}
-	// Destroy even if ctx is already done (over budget, timeout).
-	defer func() {
-		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancel()
-		if err := s.Client.Destroy(dctx, sb.ID); err != nil && s.Log != nil {
-			s.Log.Error("destroy sandbox", "sandbox", sb.ID, "err", err)
-		}
-	}()
-	if req.Track != nil {
-		if err := req.Track(sandboxPrefix + sb.ID); err != nil {
-			return 0, fmt.Errorf("record sandbox: %w", err)
-		}
 	}
 	if req.Stderr != nil {
 		fmt.Fprintf(req.Stderr, "stagehand: sandbox %s (template %s)\n", sb.ID, s.Template)
@@ -138,13 +150,46 @@ func (s Sandboxd) Run(ctx context.Context, req Request, onLine func([]byte)) (in
 	return code, err
 }
 
-// Cleanup destroys a VM left by a crashed runner.
-func (s Sandboxd) Cleanup(ctx context.Context, resource string) error {
-	id, ok := strings.CutPrefix(resource, sandboxPrefix)
+// Cleanup destroys every VM created under a recorded job id and reports done
+// once a complete listing shows none left. A failed list or destroy leaves
+// the record pending, and the engine retries it.
+func (s Sandboxd) Cleanup(ctx context.Context, resource string) (bool, error) {
+	jobID, ok := strings.CutPrefix(resource, sandboxJobPrefix)
 	if !ok {
-		return nil
+		return false, nil
 	}
-	return s.Client.Destroy(ctx, id)
+	return s.destroyJob(ctx, jobID)
+}
+
+// destroyJob destroys the VMs whose metadata carries jobID and confirms with
+// a fresh listing that none is left.
+func (s Sandboxd) destroyJob(ctx context.Context, jobID string) (bool, error) {
+	list, err := s.Client.List(ctx)
+	if err != nil {
+		return false, err
+	}
+	var errs []error
+	for _, sb := range list {
+		if sb.Metadata["job_id"] != jobID {
+			continue
+		}
+		if err := s.Client.Destroy(ctx, sb.ID); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return false, errors.Join(errs...)
+	}
+	list, err = s.Client.List(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, sb := range list {
+		if sb.Metadata["job_id"] == jobID {
+			return false, fmt.Errorf("sandbox %s for %s still listed after destroy", sb.ID, jobID)
+		}
+	}
+	return true, nil
 }
 
 // lineWriter splits a byte stream into lines.

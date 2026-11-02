@@ -164,8 +164,9 @@ agent:
   (the token for that attempt), so `anthropic/*` models work through this path.
 - **One stage at a time:** each instance has one host port, so only one agent stage runs at a
   time. A second one fails to start.
-- **Crash recovery:** after a crash, `serve` destroys every VM that was recorded for an
-  interrupted attempt.
+- **Crash recovery:** the sandbox job id is recorded before the VM is requested. Cleanup finds
+  VMs by that id in the instance's inventory, so even a VM whose create response was lost gets
+  destroyed.
 
 Unit files and an example config are in [`deploy/`](deploy/).
 
@@ -198,9 +199,15 @@ Unit files and an example config are in [`deploy/`](deploy/).
 - **One run at a time:** a pipeline has at most one running run. A schedule that comes due while
   a run is still going fires as soon as that run ends. Missed slots become a single run.
 - **Crash recovery:** if stagehand stops or crashes during a stage, the next start marks that
-  attempt `interrupted` and parks the run. It never retries the stage on its own, because a half-done
-  stage may have side effects. It also kills the stage's leftover process group if that group is
-  still running.
+  attempt `interrupted` and parks the run. It never retries the stage on its own, because a
+  half-done stage may have side effects. A shell stage's command is held until its process group
+  has been recorded, so a crash never leaves an untracked command running.
+- **Cleanup:** every process group or sandbox an attempt starts is recorded as a pending cleanup
+  before it starts, and the record is removed only once it is confirmed gone. Anything left over
+  (after a crash, or a sandbox delete that failed) is retried at the next start and every minute
+  while `serve` runs.
+- **Stopping:** on `SIGTERM`, stagehand stops the running stages and starts nothing new. A run
+  whose next stage was ready stays `running`, and the next runner continues it.
 
 ## Commands
 
@@ -225,11 +232,14 @@ version
 - **Home directory:** the database, logs and work files live in the home. It is `--home`, else
   `$STAGEHAND_HOME`, else `/var/lib/stagehand` for root, else `$XDG_STATE_HOME/stagehand`.
 - **One executor per home:** only one process runs stages for a home at a time, enforced by a
-  lock on `stagehand.lock`.
-  - When `serve` is running, `run`, `resume` and `cancel` only record the request, and `serve`
-    carries it out.
-  - When it is not running, those commands run the stages themselves and return when the run
-    ends.
+  lock on `stagehand.lock`. The lock file records whether its holder is `serve` or a one-off
+  command.
+  - When `serve` holds it, `run`, `resume` and `cancel` only record the request, and `serve`
+    carries it out. With `--wait`, the command waits for the result and takes over if `serve`
+    goes away.
+  - When another one-off command holds it, `run` and `resume` wait for the lock and then run
+    their own stages. They are never left queued with nobody to run them.
+  - When nobody holds it, the command runs the stages itself and returns when the run ends.
 - **Exit status:** `run` and `resume` exit non-zero unless the run succeeded.
 
 ### Status for dashboards

@@ -3,16 +3,22 @@ package agentexec
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"syscall"
 	"time"
 
+	"github.com/gitmoot/stagehand/internal/procgroup"
 	"github.com/gitmoot/stagehand/internal/shellexec"
 )
+
+// localKillGrace is how long omp gets after SIGTERM before SIGKILL.
+const localKillGrace = 5 * time.Second
+
+// drainGrace bounds how long stdout is read after omp's group is gone: a
+// process that escaped the group could otherwise hold the pipe open forever.
+const drainGrace = 2 * time.Second
 
 // Local runs omp as a process on the runner's host.
 //
@@ -25,7 +31,7 @@ type Local struct {
 	// Dir is where per-run scratch directories are created.
 	Dir string
 	// Env is omp's complete environment (KEY=VALUE). Nothing else is
-	// inherited.
+	// inherited; nil means an empty environment.
 	Env []string
 }
 
@@ -50,58 +56,83 @@ func (l Local) Run(ctx context.Context, req Request, onLine func([]byte)) (int, 
 		}
 	}
 
-	cmd := exec.Command(bin, req.Args...)
-	cmd.Dir = dir
-	cmd.Env = l.Env
-	cmd.Stdin = nil // omp reads stdin to EOF in json mode; /dev/null ends it
-	cmd.Stderr = req.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	stdout, err := cmd.StdoutPipe()
+	// stdout is a plain pipe the runner owns, so omp's exit is observed from
+	// the process itself, not from stdout reaching EOF.
+	outR, outW, err := os.Pipe()
 	if err != nil {
 		return 0, err
 	}
-	if err := cmd.Start(); err != nil {
+	defer outR.Close()
+	cmd := procgroup.Exec("", bin, req.Args...)
+	cmd.Dir = dir
+	cmd.Env = append([]string{}, l.Env...)
+	cmd.Stdin = nil // omp reads stdin to EOF in json mode; /dev/null ends it
+	cmd.Stdout = outW
+	cmd.Stderr = req.Stderr
+	p, err := procgroup.Start(cmd)
+	outW.Close()
+	if err != nil {
 		return 0, err
 	}
-	pgid := cmd.Process.Pid
-	if req.Track != nil {
-		if err := req.Track(shellexec.ProcessResource(pgid)); err != nil {
-			_ = syscall.Kill(-pgid, syscall.SIGKILL)
-			_ = cmd.Wait()
-			return 0, fmt.Errorf("record process: %w", err)
+	resource := shellexec.ProcessResource(p.PGID)
+	if err := procgroup.Record(ctx, req.Track, resource); err != nil {
+		p.Abort()
+		_, _ = p.Finish()
+		if req.Release != nil {
+			req.Release(resource)
+		}
+		return 0, fmt.Errorf("record process: %w", err)
+	}
+	if err := p.Open(); err != nil {
+		p.Abort()
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		sc := bufio.NewScanner(outR)
+		sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
+		for sc.Scan() {
+			onLine(sc.Bytes())
+		}
+		readDone <- sc.Err()
+	}()
+
+	select {
+	case <-p.Exited():
+	case <-ctx.Done():
+		p.Signal(syscall.SIGTERM)
+		select {
+		case <-p.Exited():
+		case <-time.After(localKillGrace):
+			p.Signal(syscall.SIGKILL)
 		}
 	}
-
-	stop := context.AfterFunc(ctx, func() {
-		_ = syscall.Kill(-pgid, syscall.SIGTERM)
-		time.AfterFunc(5*time.Second, func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
-	})
-	defer stop()
-
-	sc := bufio.NewScanner(stdout)
-	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
-	for sc.Scan() {
-		onLine(sc.Bytes())
+	// Leader gone: kill what it left in its group, reap it, then drain what
+	// it wrote. A writer outside the group cannot hold the stage open.
+	code, waitErr := p.Finish()
+	if req.Release != nil {
+		req.Release(resource)
 	}
-	scanErr := sc.Err()
-	waitErr := cmd.Wait()
-	_ = syscall.Kill(-pgid, syscall.SIGKILL)
-
-	if scanErr != nil {
-		return 0, fmt.Errorf("read omp output: %w", scanErr)
+	var readErr error
+	select {
+	case readErr = <-readDone:
+	case <-time.After(drainGrace):
+		outR.Close()
+		readErr = <-readDone
+		if readErr == nil {
+			readErr = fmt.Errorf("omp's stdout stayed open after it exited")
+		}
 	}
-	var exitErr *exec.ExitError
-	switch {
-	case waitErr == nil:
-		return 0, nil
-	case errors.As(waitErr, &exitErr):
-		return exitErr.ExitCode(), nil
-	default:
+	if waitErr != nil {
 		return 0, waitErr
 	}
+	if readErr != nil && ctx.Err() == nil {
+		return code, fmt.Errorf("read omp output: %w", readErr)
+	}
+	return code, nil
 }
 
 // Cleanup stops a process group left by a crashed runner.
-func (Local) Cleanup(ctx context.Context, resource string) error {
+func (Local) Cleanup(ctx context.Context, resource string) (bool, error) {
 	return shellexec.Executor{}.Cleanup(ctx, resource)
 }

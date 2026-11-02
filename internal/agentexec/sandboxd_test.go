@@ -18,19 +18,30 @@ import (
 	"github.com/gitmoot/stagehand/internal/stage"
 )
 
-// fakeSandboxd implements the strict-profile routes stagehand uses. Exec of
-// the configured omp path replays stdout lines; it can hang until the client
-// goes away.
+// fakeSandboxd implements the strict-profile routes stagehand uses and keeps
+// a live inventory. Exec of the configured omp path replays stdout lines; it
+// can hang until the client goes away.
 type fakeSandboxd struct {
 	t        *testing.T
 	mu       sync.Mutex
 	created  []map[string]any
+	live     map[string]string // sandbox id -> job_id
 	uploads  map[string]string
 	execs    []map[string]any
 	deleted  []string
 	ompLines []string
 	ompHang  bool
 	ompExit  int
+	// deleteFails makes the next N DELETEs answer 503 and keep the VM.
+	deleteFails int
+	// truncateCreate allocates the VM but cuts the create response.
+	truncateCreate bool
+}
+
+func (f *fakeSandboxd) liveCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.live)
 }
 
 func (f *fakeSandboxd) handler() http.Handler {
@@ -42,16 +53,38 @@ func (f *fakeSandboxd) handler() http.Handler {
 		}
 		var body map[string]any
 		json.NewDecoder(r.Body).Decode(&body)
+		meta := body["metadata"].(map[string]any)
 		f.mu.Lock()
 		f.created = append(f.created, body)
+		f.live["sandboxd-abc"] = meta["job_id"].(string)
+		truncate := f.truncateCreate
 		f.mu.Unlock()
 		w.WriteHeader(201)
+		if truncate {
+			w.Write([]byte(`{"sandboxID":"sandboxd-a`))
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]any{"sandboxID": "sandboxd-abc", "envdAccessToken": "tok", "templateID": body["templateID"]})
+	})
+	mux.HandleFunc("GET /v2/sandboxes", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		out := []map[string]any{}
+		for id, job := range f.live {
+			out = append(out, map[string]any{"sandboxID": id, "metadata": map[string]string{"job_id": job}})
+		}
+		f.mu.Unlock()
+		json.NewEncoder(w).Encode(out)
 	})
 	mux.HandleFunc("DELETE /sandboxes/{id}", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
+		defer f.mu.Unlock()
 		f.deleted = append(f.deleted, r.PathValue("id"))
-		f.mu.Unlock()
+		if f.deleteFails > 0 {
+			f.deleteFails--
+			http.Error(w, "uncertain destroy", http.StatusServiceUnavailable)
+			return
+		}
+		delete(f.live, r.PathValue("id"))
 		w.WriteHeader(204)
 	})
 	mux.HandleFunc("POST /files", func(w http.ResponseWriter, r *http.Request) {
@@ -107,7 +140,7 @@ func (f *fakeSandboxd) handler() http.Handler {
 
 func newFake(t *testing.T) (*fakeSandboxd, Sandboxd, string) {
 	t.Helper()
-	f := &fakeSandboxd{t: t, uploads: map[string]string{}}
+	f := &fakeSandboxd{t: t, uploads: map[string]string{}, live: map[string]string{}}
 	srv := httptest.NewServer(f.handler())
 	t.Cleanup(srv.Close)
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
@@ -125,26 +158,53 @@ func newFake(t *testing.T) (*fakeSandboxd, Sandboxd, string) {
 	return f, be, addr
 }
 
+// recorder captures Track/Release like the engine's pending-cleanup table.
+type recorder struct {
+	mu      sync.Mutex
+	tracked []string
+	pending map[string]bool
+}
+
+func (r *recorder) attach(job *stage.Job) {
+	r.pending = map[string]bool{}
+	job.Track = func(res string) error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.tracked = append(r.tracked, res)
+		r.pending[res] = true
+		return nil
+	}
+	job.Release = func(res string) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		delete(r.pending, res)
+	}
+}
+
 func TestSandboxdRunsOmpInAFreshVMAndDestroysIt(t *testing.T) {
 	f, be, _ := newFake(t)
 	f.ompLines = []string{msg(`{"ok":true}`, 0.1), end}
 	job := newJob(t, 1)
-	var tracked []string
-	job.Track = func(r string) error { tracked = append(tracked, r); return nil }
+	var rec recorder
+	rec.attach(&job)
 	res := Executor{Backend: be}.Execute(context.Background(), job)
 	if res.Outcome != stage.Succeeded {
 		t.Fatalf("%+v", res)
 	}
-	if len(tracked) != 1 || tracked[0] != "sandboxd:sandboxd-abc" {
-		t.Errorf("tracked %v", tracked)
+	meta := f.created[0]["metadata"].(map[string]any)
+	if len(rec.tracked) != 1 || rec.tracked[0] != "sandboxd-job:"+meta["job_id"].(string) {
+		t.Errorf("tracked %v, want the job id recorded", rec.tracked)
+	}
+	if len(rec.pending) != 0 {
+		t.Errorf("pending %v after a confirmed destroy", rec.pending)
 	}
 	if f.uploads["/home/user/work/rows.json"] != `[{"id":1}]` {
 		t.Errorf("uploads %v", f.uploads)
 	}
-	if len(f.deleted) != 1 {
-		t.Errorf("deleted %v, want the VM destroyed once", f.deleted)
+	if f.liveCount() != 0 {
+		t.Error("VM left running")
 	}
-	meta := f.created[0]["metadata"].(map[string]any)
+	meta = f.created[0]["metadata"].(map[string]any)
 	if !strings.HasPrefix(meta["job_id"].(string), "stagehand-") || meta["attempt"] != "1" || f.created[0]["secure"] != true {
 		t.Errorf("create body %v", f.created[0])
 	}
@@ -189,11 +249,58 @@ func TestSandboxdOverBudgetDestroysVM(t *testing.T) {
 	}
 }
 
-func TestSandboxdCleanupDestroysOnlySandboxResources(t *testing.T) {
+// A DELETE that sandboxd answers with 503 leaves the VM: the record must stay
+// pending, even though the stage succeeded, and a later Cleanup destroys it.
+func TestSandboxdUnconfirmedDestroyStaysPending(t *testing.T) {
 	f, be, _ := newFake(t)
-	be.Cleanup(context.Background(), "process:123@4")
-	be.Cleanup(context.Background(), "sandboxd:sandboxd-old")
-	if len(f.deleted) != 1 || f.deleted[0] != "sandboxd-old" {
-		t.Errorf("deleted %v", f.deleted)
+	f.ompLines = []string{msg(`{"ok":true}`, 0.1), end}
+	f.deleteFails = 1
+	job := newJob(t, 1)
+	var rec recorder
+	rec.attach(&job)
+	if res := (Executor{Backend: be}).Execute(context.Background(), job); res.Outcome != stage.Succeeded {
+		t.Fatalf("%+v", res)
+	}
+	if f.liveCount() != 1 || len(rec.pending) != 1 {
+		t.Fatalf("live %d, pending %v; want the VM alive and its record pending", f.liveCount(), rec.pending)
+	}
+	done, err := be.Cleanup(context.Background(), rec.tracked[0])
+	if err != nil || !done || f.liveCount() != 0 {
+		t.Fatalf("retry: done=%v err=%v live=%d", done, err, f.liveCount())
+	}
+}
+
+// If the create response is lost, the VM still exists; it carries the job id
+// recorded before the request, so the attempt's own cleanup finds it.
+func TestSandboxdAmbiguousCreateIsCleanedUp(t *testing.T) {
+	f, be, _ := newFake(t)
+	f.truncateCreate = true
+	job := newJob(t, 1)
+	var rec recorder
+	rec.attach(&job)
+	res := Executor{Backend: be}.Execute(context.Background(), job)
+	if res.Outcome != stage.Failed {
+		t.Fatalf("%+v", res)
+	}
+	if len(rec.tracked) != 1 {
+		t.Fatalf("tracked %v; the job id must be recorded before create", rec.tracked)
+	}
+	if f.liveCount() != 0 || len(rec.pending) != 0 {
+		t.Errorf("live %d, pending %v; want the allocated VM found and destroyed", f.liveCount(), rec.pending)
+	}
+}
+
+func TestSandboxdCleanupIgnoresOtherResources(t *testing.T) {
+	f, be, _ := newFake(t)
+	f.live["sandboxd-other"] = "someone-else"
+	f.live["sandboxd-old"] = "stagehand-old"
+	if done, err := be.Cleanup(context.Background(), "process:123@4"); done || err != nil {
+		t.Errorf("process resource: done=%v err=%v", done, err)
+	}
+	if done, err := be.Cleanup(context.Background(), "sandboxd-job:stagehand-old"); !done || err != nil {
+		t.Errorf("done=%v err=%v", done, err)
+	}
+	if !slices.Equal(f.deleted, []string{"sandboxd-old"}) {
+		t.Errorf("deleted %v; must touch only the recorded job's VM", f.deleted)
 	}
 }

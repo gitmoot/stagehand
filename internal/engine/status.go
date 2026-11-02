@@ -105,10 +105,13 @@ func (e *Engine) Status(ctx context.Context, version string) (Status, error) {
 				return Status{}, err
 			}
 			ps.LastRun = &sum
-			if last.State == store.RunRunning {
-				id := last.ID
-				ps.ActiveRunID = &id
-			}
+		}
+		active, err := e.Store.ActiveRunID(ctx, p.Name)
+		if err != nil {
+			return Status{}, err
+		}
+		if active != 0 {
+			ps.ActiveRunID = &active
 		}
 		out.Pipelines = append(out.Pipelines, ps)
 	}

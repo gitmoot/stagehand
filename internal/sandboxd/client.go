@@ -43,9 +43,53 @@ func (c *Client) http() *http.Client {
 
 // Sandbox is a created VM.
 type Sandbox struct {
-	ID          string `json:"sandboxID"`
-	AccessToken string `json:"envdAccessToken"`
-	TemplateID  string `json:"templateID"`
+	ID          string            `json:"sandboxID"`
+	AccessToken string            `json:"envdAccessToken"`
+	TemplateID  string            `json:"templateID"`
+	Metadata    map[string]string `json:"metadata"`
+}
+
+// maxListPages bounds List so a misbehaving server cannot loop it forever.
+const maxListPages = 100
+
+// List returns every sandbox the instance knows. It fails rather than
+// returning a partial list: only a complete listing proves a VM is gone.
+func (c *Client) List(ctx context.Context) ([]Sandbox, error) {
+	var out []Sandbox
+	next := ""
+	for range maxListPages {
+		q := url.Values{"limit": {"100"}}
+		if next != "" {
+			q.Set("nextToken", next)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/v2/sandboxes?"+q.Encode(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("X-API-Key", c.APIKey)
+		resp, err := c.http().Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("sandboxd list: %w", err)
+		}
+		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+		resp.Body.Close()
+		if rerr != nil {
+			return nil, fmt.Errorf("sandboxd list: %w", rerr)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("sandboxd list: HTTP %d: %s", resp.StatusCode, truncate(raw))
+		}
+		var page []Sandbox
+		if err := json.Unmarshal(raw, &page); err != nil {
+			return nil, fmt.Errorf("sandboxd list: %w", err)
+		}
+		out = append(out, page...)
+		next = resp.Header.Get("X-Next-Token")
+		if next == "" {
+			return out, nil
+		}
+	}
+	return nil, errors.New("sandboxd list: too many pages")
 }
 
 // CreateRequest is a VM to create. Metadata must carry job_id (unique per

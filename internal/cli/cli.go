@@ -551,57 +551,61 @@ func (a *app) cancel(ctx context.Context, args []string) error {
 	if err := a.engine.Cancel(ctx, id); err != nil {
 		return err
 	}
-	executed, err := a.execute(ctx, map[int64]bool{id: true})
+	// If no process holds the lock, finish the cancel here; otherwise the
+	// process executing the run stops it.
+	lock, err := homelock.TryAcquire(filepath.Join(a.home, "stagehand.lock"), homelock.ModeCLI)
 	if err != nil {
+		if errors.Is(err, homelock.ErrHeld) {
+			fmt.Fprintf(a.stdout, "cancel of run #%d requested; the stagehand process executing it stops it\n", id)
+			return nil
+		}
 		return err
 	}
-	if !executed {
-		fmt.Fprintf(a.stdout, "cancel of run #%d requested; the running stagehand process stops it\n", id)
-		return nil
+	defer lock.Release()
+	if err := a.engine.Recover(ctx); err != nil {
+		return err
+	}
+	if err := a.engine.Loop(ctx, engine.LoopOptions{Only: map[int64]bool{id: true}, UntilIdle: true}); err != nil {
+		return err
 	}
 	fmt.Fprintf(a.stdout, "run #%d cancelled\n", id)
 	return nil
 }
 
-// finish executes the run here if no other process holds the lock;
-// otherwise it leaves it to that process and, with wait, polls until the run
-// settles. It prints the run and fails unless it succeeded.
+// finish gets the run executed and reports it. If no process holds the home
+// lock, this one executes the run. If `serve` holds it, serve executes the
+// run: finish returns at once, or with wait polls until the run settles. If
+// another short-lived command holds it, that command will not run this one,
+// so finish waits for the lock and then executes it here. It prints the run
+// and fails unless the run succeeded.
 func (a *app) finish(ctx context.Context, id int64, wait, asJSON bool) error {
-	executed, err := a.execute(ctx, map[int64]bool{id: true})
-	if err != nil {
+	executed, err := a.execute(ctx, id, wait)
+	if err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
-	if !executed {
-		if !wait {
-			fmt.Fprintf(a.stdout, "run #%d queued; the running stagehand process executes it (stagehand show %d)\n", id, id)
-			return nil
-		}
-		for {
-			r, err := a.store.GetRun(ctx, id)
-			if err != nil {
-				return err
-			}
-			if r.State != store.RunRunning {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(2 * time.Second):
-			}
-		}
+	if !executed && err == nil && !wait {
+		fmt.Fprintf(a.stdout, "run #%d queued; the running stagehand serve executes it (stagehand show %d)\n", id, id)
+		return nil
 	}
-	d, err := a.engine.Run(context.WithoutCancel(ctx), id)
-	if err != nil {
-		return err
+	d, derr := a.engine.Run(context.WithoutCancel(ctx), id)
+	if derr != nil {
+		return derr
 	}
 	if asJSON {
-		err = a.printJSON(d)
+		derr = a.printJSON(d)
 	} else {
-		err = a.printRun(d)
+		derr = a.printRun(d)
+	}
+	if derr != nil {
+		return derr
 	}
 	if err != nil {
-		return err
+		if d.State == store.RunRunning {
+			fmt.Fprintf(a.stderr, "interrupted; run #%d is not finished: `stagehand tick` or `stagehand serve` continues it\n", id)
+		} else {
+			fmt.Fprintf(a.stderr, "interrupted; run #%d is parked: `stagehand resume %d` re-runs it\n", id, id)
+		}
+		return exitCode(130)
 	}
 	if d.State != store.RunSucceeded {
 		return exitCode(1)
@@ -609,25 +613,50 @@ func (a *app) finish(ctx context.Context, id int64, wait, asJSON bool) error {
 	return nil
 }
 
-// execute runs the selected runs to the end in this process if it can take
-// the home lock. It reports false if another process holds it.
-func (a *app) execute(ctx context.Context, only map[int64]bool) (bool, error) {
-	lock, err := homelock.TryAcquire(filepath.Join(a.home, "stagehand.lock"))
-	if errors.Is(err, homelock.ErrHeld) {
-		return false, nil
+// lockPoll is how often a waiting command retries the home lock.
+const lockPoll = time.Second
+
+// execute gets run id executed. It reports whether this process executed it.
+//
+// While `serve` holds the lock it is serve's job: execute returns false at
+// once, or with wait polls until the run settles (taking over if serve goes
+// away). While another command holds the lock, execute waits for it, since
+// that command only runs its own runs.
+func (a *app) execute(ctx context.Context, id int64, wait bool) (bool, error) {
+	announced := false
+	for {
+		lock, err := homelock.TryAcquire(filepath.Join(a.home, "stagehand.lock"), homelock.ModeCLI)
+		if err == nil {
+			defer lock.Release()
+			if err := a.engine.Recover(ctx); err != nil {
+				return true, err
+			}
+			return true, a.engine.Loop(ctx, engine.LoopOptions{Only: map[int64]bool{id: true}, UntilIdle: true})
+		}
+		var held *homelock.HeldError
+		if !errors.As(err, &held) {
+			return false, err
+		}
+		if held.Mode == homelock.ModeServe && !wait {
+			return false, nil
+		}
+		r, err := a.store.GetRun(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		if r.State != store.RunRunning {
+			return false, nil // settled by the other process
+		}
+		if !announced && held.Mode != homelock.ModeServe {
+			fmt.Fprintf(a.stderr, "waiting for stagehand pid %d to finish before running #%d\n", held.PID, id)
+			announced = true
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(lockPoll):
+		}
 	}
-	if err != nil {
-		return false, err
-	}
-	defer lock.Release()
-	if err := a.engine.Recover(ctx); err != nil {
-		return true, err
-	}
-	err = a.engine.Loop(ctx, engine.LoopOptions{Only: only, UntilIdle: true})
-	if errors.Is(err, context.Canceled) {
-		return true, errors.New("interrupted; the run is parked and can be resumed")
-	}
-	return true, err
 }
 
 // ---- service ----
@@ -639,7 +668,7 @@ func (a *app) serve(ctx context.Context, args []string) error {
 	if _, err := parse(fs, args, 0, "serve [--status-addr 127.0.0.1:PORT] [--poll 5s]"); err != nil {
 		return err
 	}
-	lock, err := homelock.TryAcquire(filepath.Join(a.home, "stagehand.lock"))
+	lock, err := homelock.TryAcquire(filepath.Join(a.home, "stagehand.lock"), homelock.ModeServe)
 	if err != nil {
 		return err
 	}
@@ -668,7 +697,7 @@ func (a *app) tick(ctx context.Context, args []string) error {
 	if _, err := parse(flag.NewFlagSet("tick", flag.ContinueOnError), args, 0, "tick"); err != nil {
 		return err
 	}
-	lock, err := homelock.TryAcquire(filepath.Join(a.home, "stagehand.lock"))
+	lock, err := homelock.TryAcquire(filepath.Join(a.home, "stagehand.lock"), homelock.ModeCLI)
 	if errors.Is(err, homelock.ErrHeld) {
 		fmt.Fprintln(a.stdout, "another stagehand process is running; nothing to do")
 		return nil

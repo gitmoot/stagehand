@@ -41,11 +41,16 @@ type Job struct {
 	// else is inherited.
 	Env []string
 
-	// Track durably records what the attempt started outside the runner (a
-	// process group, a sandbox) before it does any work, so a crashed runner
-	// can stop it later. The value is executor-defined, e.g. "process:..." or
-	// "sandbox:...".
+	// Track durably records something the attempt starts outside the runner:
+	// before starting it when it can be named in advance (a sandbox job id),
+	// otherwise as soon as it exists (a process group). The record stays as
+	// a pending cleanup until Release confirms the thing is gone; a crashed
+	// or failed cleanup is retried by the engine's cleanup sweep. The value
+	// is executor-defined, e.g. "process:..." or "sandboxd-job:...".
 	Track func(resource string) error
+	// Release forgets a tracked resource once the executor has confirmed it
+	// no longer exists.
+	Release func(resource string)
 }
 
 // Result is what an executor reports. Cost and tokens are reported even on
@@ -67,8 +72,10 @@ type Executor interface {
 }
 
 // Cleaner is implemented by executors that start things outside the runner.
-// After a crash the engine offers every interrupted attempt's resource to
-// every Cleaner; each stops the ones it recognises and ignores the rest.
+// The engine offers every pending cleanup that no running attempt owns to
+// every Cleaner. done reports that the resource is confirmed gone (or never
+// existed) and can be forgotten; false with a nil error means "not mine" or
+// "not confirmable yet, ask again later".
 type Cleaner interface {
-	Cleanup(ctx context.Context, resource string) error
+	Cleanup(ctx context.Context, resource string) (done bool, err error)
 }
