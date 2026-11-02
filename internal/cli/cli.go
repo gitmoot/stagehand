@@ -20,7 +20,9 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/gitmoot/stagehand/internal/agentexec"
 	"github.com/gitmoot/stagehand/internal/buildinfo"
+	"github.com/gitmoot/stagehand/internal/config"
 	"github.com/gitmoot/stagehand/internal/engine"
 	"github.com/gitmoot/stagehand/internal/homelock"
 	"github.com/gitmoot/stagehand/internal/shellexec"
@@ -56,6 +58,9 @@ Service:
 The home (state database, run logs and work files) is --home, else
 $STAGEHAND_HOME, else /var/lib/stagehand for root or
 $XDG_STATE_HOME/stagehand (~/.local/state/stagehand).
+
+Runner settings (how agent stages execute) are read from --config, else
+$STAGEHAND_CONFIG, else <home>/config.yaml if it exists.
 `
 
 // Main runs the CLI and returns the process exit code.
@@ -63,6 +68,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	global := flag.NewFlagSet("stagehand", flag.ContinueOnError)
 	global.SetOutput(stderr)
 	home := global.String("home", "", "state directory")
+	configPath := global.String("config", os.Getenv("STAGEHAND_CONFIG"), "runner settings file")
 	global.Usage = func() { fmt.Fprint(stderr, usage) }
 	if err := global.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -87,7 +93,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	a, err := open(ctx, *home, stderr)
+	a, err := open(ctx, *home, *configPath, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "stagehand:", err)
 		return 1
@@ -151,7 +157,7 @@ func DefaultHome() (string, error) {
 	return filepath.Join(h, ".local", "state", "stagehand"), nil
 }
 
-func open(ctx context.Context, home string, stderr io.Writer) (*app, error) {
+func open(ctx context.Context, home, configPath string, stderr io.Writer) (*app, error) {
 	if home == "" {
 		var err error
 		if home, err = DefaultHome(); err != nil {
@@ -165,12 +171,28 @@ func open(ctx context.Context, home string, stderr io.Writer) (*app, error) {
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		return nil, err
 	}
+	required := configPath != ""
+	if configPath == "" {
+		configPath = filepath.Join(home, "config.yaml")
+	}
+	cfg, err := config.Load(configPath, required)
+	if err != nil {
+		return nil, err
+	}
 	st, err := store.Open(ctx, filepath.Join(home, "stagehand.db"))
 	if err != nil {
 		return nil, err
 	}
 	log := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	executors := map[spec.Kind]stage.Executor{spec.KindShell: shellexec.Executor{}}
+	switch cfg.Agent.Executor {
+	case config.ExecutorLocal:
+		executors[spec.KindAgent] = agentexec.Executor{Backend: agentexec.Local{
+			Omp: cfg.Agent.Omp,
+			Dir: filepath.Join(home, "agent-scratch"),
+			Env: baseEnv(),
+		}}
+	}
 	eng := engine.New(st, home, executors, baseEnv(), log)
 	return &app{home: home, store: st, engine: eng, stderr: stderr, log: log}, nil
 }

@@ -11,8 +11,9 @@ waits; you fix the problem and resume it.
   extracted so a production job can depend on it without depending on Gitmoot.
 
 > **Status:** v1 is in progress ([epic #2](https://github.com/gitmoot/stagehand/issues/2)).
-> Shell stages, schedules, run records, resume and status work today. Agent stages (omp, run
-> inside a sandboxd VM) are being added in #4–#6.
+> Shell stages, schedules, run records, resume, status, and omp agent stages (with a usage cap
+> and checked JSON output) work today. Running agent stages inside a sandboxd VM is being added
+> in #5–#6; until then the only agent executor is the unsandboxed development one.
 
 ## Install
 
@@ -68,10 +69,61 @@ stages:
 | `timeout` | Time limit, as a Go duration. Default: `1h` for shell stages |
 | `retry` | How many extra attempts a failed stage gets (0–10) |
 | `env_keys` | Variables the stage may see, taken from `env_file` first, then `env`. Nothing else is passed |
-| `agent`, `model`, `effort`, `prompt`, `prompt_file`, `inputs`, `output`, `tools`, `max_cost` | Agent stages (omp). Validated now; they run once the agent executor ships |
+
+Agent stage keys (`agent: omp`):
+
+| Key | Meaning |
+|---|---|
+| `agent` | `omp` |
+| `model`, `effort` | omp `--model` and `--thinking` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`) |
+| `prompt` or `prompt_file` | The instructions. `prompt_file` is resolved relative to the spec's directory |
+| `inputs` | Files from `$STAGEHAND_WORK` copied into the agent's working directory |
+| `output` | Required. File in `$STAGEHAND_WORK` that the **runner** writes from the agent's final answer, which must be JSON |
+| `tools` | Read-only omp tools: `read`, `web_search`, `grep`, `glob`. Default: `read, web_search` |
+| `max_cost` | Required. Usage cap per attempt, in omp's list-price units (USD for API pricing) |
+| `timeout` | Required for agent stages |
+
+Agent stages take no `cwd` or `env_keys`: the agent receives no environment and no secrets.
 
 Unknown keys are errors, so a typo fails when you add the pipeline instead of being silently
 ignored.
+
+### Agent stages
+
+An agent stage runs omp headless:
+
+```
+omp -p --mode=json --no-session --no-skills --no-rules --no-extensions --no-lsp --no-pty --tools=<tools> …
+```
+
+- **The agent writes nothing.** It has only read-only tools. The runner takes its final
+  message, accepts either pure JSON or a single fenced block, and writes that as `output`. An
+  answer that is not valid JSON fails the stage, and nothing is written. A leftover output from
+  an earlier attempt is deleted before the stage starts.
+- **Success is read from omp's event stream, not its exit code.** omp exits 0 even when a turn
+  fails. A failed turn, a retry omp gave up on, a cut-off answer or a stream with no final
+  `agent_end` all fail the stage.
+- **Usage cap:** the runner adds up `usage.cost.total` from every assistant message and stops
+  omp as soon as the total passes `max_cost`. The stage then fails with `over budget`, and the
+  cost so far is recorded. The cap can be overshot by up to the cost of one model call.
+- **Time limit:** `timeout` applies, and omp also gets `--max-time` set to 90% of the time left,
+  so it can report before it is stopped.
+- **Prompt:** the runner adds a short note to the prompt listing the input files and saying the
+  answer must be JSON only.
+
+Where omp runs is a host setting, not part of the pipeline. Set it in the runner settings file
+(`--config`, `$STAGEHAND_CONFIG`, or `<home>/config.yaml`):
+
+```yaml
+agent:
+  executor: local            # development only: omp runs on this host, unsandboxed
+  allow_unsafe_local: true   # required with local
+  omp: /usr/local/bin/omp    # optional; default "omp" on PATH
+```
+
+The `local` executor is **not a sandbox**. omp's `read` tool can read any file the runner can
+read and can fetch URLs. Production agent stages run in a sandboxd Firecracker VM instead
+(#5). With no executor configured, an agent stage fails with "no agent executor is configured on this runner".
 
 ## How a run works
 
@@ -109,7 +161,7 @@ ignored.
 ## Commands
 
 ```
-stagehand [--home DIR] <command>
+stagehand [--home DIR] [--config FILE] <command>
 
 add <spec.yaml> [--replace] [--enable]   register (or update) a pipeline
 list [--json]                            pipelines with schedule and last run
