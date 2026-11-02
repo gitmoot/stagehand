@@ -25,6 +25,7 @@ import (
 	"github.com/gitmoot/stagehand/internal/config"
 	"github.com/gitmoot/stagehand/internal/engine"
 	"github.com/gitmoot/stagehand/internal/homelock"
+	"github.com/gitmoot/stagehand/internal/sandboxd"
 	"github.com/gitmoot/stagehand/internal/shellexec"
 	"github.com/gitmoot/stagehand/internal/spec"
 	"github.com/gitmoot/stagehand/internal/stage"
@@ -52,6 +53,8 @@ Runs:
 Service:
   serve [--status-addr 127.0.0.1:PORT] [--poll 5s]  run schedules and stages until stopped
   tick                                     one pass: fire due schedules, run them to the end
+  gateway-proxy [--listen ADDR] [--upstream URL] [--token-file FILE]
+                                           model credential proxy for sandboxed agent stages
   status [--json]                          last and next run per pipeline
   version
 
@@ -90,9 +93,17 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stdout, usage)
 		return 0
 	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if cmd == "gateway-proxy" {
+		// Runs on the host holding the omp auth-gateway token; needs no home.
+		if err := gatewayProxy(ctx, cmdArgs, stderr); err != nil {
+			fmt.Fprintln(stderr, "stagehand:", err)
+			return 1
+		}
+		return 0
+	}
+
 	a, err := open(ctx, *home, *configPath, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "stagehand:", err)
@@ -191,6 +202,23 @@ func open(ctx context.Context, home, configPath string, stderr io.Writer) (*app,
 			Omp: cfg.Agent.Omp,
 			Dir: filepath.Join(home, "agent-scratch"),
 			Env: baseEnv(),
+		}}
+	case config.ExecutorSandboxd:
+		sc := cfg.Agent.Sandboxd
+		key, err := readSecretFile(sc.APIKeyFile)
+		if err != nil {
+			st.Close()
+			return nil, fmt.Errorf("agent.sandboxd.api_key_file: %w", err)
+		}
+		executors[spec.KindAgent] = agentexec.Executor{Backend: agentexec.Sandboxd{
+			Client:          &sandboxd.Client{BaseURL: strings.TrimRight(sc.URL, "/"), APIKey: key},
+			Template:        sc.Template,
+			GuestOmp:        sc.GuestOmpPath(),
+			MaxTTL:          sc.MaxTTLDuration(),
+			GatewayListen:   cfg.Agent.ModelGateway.Listen,
+			GuestGatewayURL: cfg.Agent.ModelGateway.GuestURL,
+			GatewayUpstream: cfg.Agent.ModelGateway.Upstream,
+			Log:             log,
 		}}
 	}
 	eng := engine.New(st, home, executors, baseEnv(), log)

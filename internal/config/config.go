@@ -8,8 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"time"
 
 	yaml "gopkg.in/yaml.v3"
 )
@@ -36,6 +39,36 @@ type Agent struct {
 	AllowUnsafeLocal bool `yaml:"allow_unsafe_local"`
 	// Omp is the omp binary for the local executor (default "omp" on PATH).
 	Omp string `yaml:"omp"`
+
+	Sandboxd     Sandboxd     `yaml:"sandboxd"`
+	ModelGateway ModelGateway `yaml:"model_gateway"`
+}
+
+// Sandboxd locates the sandboxd instance that runs agent stages.
+type Sandboxd struct {
+	// URL is the instance's -listen address, e.g. http://127.0.0.1:43292.
+	URL string `yaml:"url"`
+	// APIKeyFile is the instance's 0600 api-key file.
+	APIKeyFile string `yaml:"api_key_file"`
+	// Template is the strict-profile template id or alias.
+	Template string `yaml:"template"`
+	// GuestOmp is omp's path inside the VM (default /usr/local/bin/omp).
+	GuestOmp string `yaml:"guest_omp"`
+	// MaxTTL is the instance's -max-ttl (default 1h).
+	MaxTTL string `yaml:"max_ttl"`
+}
+
+// ModelGateway is where agents' model calls go.
+type ModelGateway struct {
+	// Listen is the loopback side of the instance's -fc-host-port, e.g.
+	// 127.0.0.1:43293.
+	Listen string `yaml:"listen"`
+	// GuestURL is the same port as the guest sees it, e.g.
+	// http://10.0.2.2:43293.
+	GuestURL string `yaml:"guest_url"`
+	// Upstream is where calls go next: the tunnel to `stagehand
+	// gateway-proxy`, e.g. http://127.0.0.1:43294.
+	Upstream string `yaml:"upstream"`
 }
 
 // Load reads path. A missing file is an empty config unless required.
@@ -69,9 +102,63 @@ func (c Config) Validate() error {
 			return fmt.Errorf("config: agent.omp %q must be an absolute path", a.Omp)
 		}
 	case ExecutorSandboxd:
-		return errors.New(`config: agent.executor "sandboxd" is not available in this build yet`)
+		s, g := a.Sandboxd, a.ModelGateway
+		var errs []error
+		if err := httpURL(s.URL); err != nil {
+			errs = append(errs, fmt.Errorf("agent.sandboxd.url: %v", err))
+		}
+		if !filepath.IsAbs(s.APIKeyFile) {
+			errs = append(errs, errors.New("agent.sandboxd.api_key_file must be an absolute path"))
+		}
+		if s.Template == "" {
+			errs = append(errs, errors.New("agent.sandboxd.template is required"))
+		}
+		if s.GuestOmp != "" && !filepath.IsAbs(s.GuestOmp) {
+			errs = append(errs, errors.New("agent.sandboxd.guest_omp must be an absolute path"))
+		}
+		if s.MaxTTL != "" {
+			if d, err := time.ParseDuration(s.MaxTTL); err != nil || d <= 0 {
+				errs = append(errs, fmt.Errorf("agent.sandboxd.max_ttl %q must be a positive duration", s.MaxTTL))
+			}
+		}
+		if host, _, err := net.SplitHostPort(g.Listen); err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
+			errs = append(errs, fmt.Errorf("agent.model_gateway.listen %q must be a loopback host:port", g.Listen))
+		}
+		if err := httpURL(g.GuestURL); err != nil {
+			errs = append(errs, fmt.Errorf("agent.model_gateway.guest_url: %v", err))
+		}
+		if err := httpURL(g.Upstream); err != nil {
+			errs = append(errs, fmt.Errorf("agent.model_gateway.upstream: %v", err))
+		}
+		if len(errs) > 0 {
+			return fmt.Errorf("config: %w", errors.Join(errs...))
+		}
 	default:
 		return fmt.Errorf("config: agent.executor %q: use sandboxd or local", a.Executor)
+	}
+	return nil
+}
+
+// GuestOmpPath is the configured guest omp path or the default.
+func (s Sandboxd) GuestOmpPath() string {
+	if s.GuestOmp == "" {
+		return "/usr/local/bin/omp"
+	}
+	return s.GuestOmp
+}
+
+// MaxTTLDuration is the configured -max-ttl or 1h.
+func (s Sandboxd) MaxTTLDuration() time.Duration {
+	if d, err := time.ParseDuration(s.MaxTTL); err == nil && d > 0 {
+		return d
+	}
+	return time.Hour
+}
+
+func httpURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("%q must be an http(s) URL", raw)
 	}
 	return nil
 }

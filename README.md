@@ -12,8 +12,8 @@ waits; you fix the problem and resume it.
 
 > **Status:** v1 is in progress ([epic #2](https://github.com/gitmoot/stagehand/issues/2)).
 > Shell stages, schedules, run records, resume, status, and omp agent stages (with a usage cap
-> and checked JSON output) work today. Running agent stages inside a sandboxd VM is being added
-> in #5–#6; until then the only agent executor is the unsandboxed development one.
+> and checked JSON output) work today. Agent stages run in sandboxd VMs; deployment is tracked
+> in #7–#8.
 
 ## Install
 
@@ -122,8 +122,52 @@ agent:
 ```
 
 The `local` executor is **not a sandbox**. omp's `read` tool can read any file the runner can
-read and can fetch URLs. Production agent stages run in a sandboxd Firecracker VM instead
-(#5). With no executor configured, an agent stage fails with "no agent executor is configured on this runner".
+read, and it can fetch URLs. With no executor configured, an agent stage fails with "no agent
+executor is configured on this runner".
+
+### Production: sandboxd
+
+In production, each attempt of an agent stage runs in a fresh
+[sandboxd](https://github.com/gitmoot/sandboxd) Firecracker VM (strict profile, guest user
+uid 1000), and the VM is destroyed afterwards.
+
+- **What goes into the VM:** only the stage's `inputs`. The VM gets no environment variables and
+  no credentials from the host.
+- **Model calls:** the guest's omp sends them to `http://10.0.2.2:<host-port>`, the only host port
+  a sandboxd instance exposes. There, stagehand runs a **run gateway** for the length of the
+  attempt. It accepts only that attempt's random token, removes it, and forwards the call.
+- **Credentials:** the real model credential is added further along, by
+  `stagehand gateway-proxy`, on the host that holds the omp auth-gateway token.
+
+```
+guest omp ── token for this attempt ──▶ run gateway (stagehand serve, 127.0.0.1:43293)
+          ──▶ 127.0.0.1:43294 (ssh -R tunnel) ──▶ stagehand gateway-proxy (127.0.0.1:43295, adds bearer)
+          ──▶ omp auth-gateway (127.0.0.1:4011) ──▶ provider
+```
+
+```yaml
+agent:
+  executor: sandboxd
+  sandboxd:
+    url: http://127.0.0.1:43292              # the instance's -listen
+    api_key_file: /var/lib/sandboxd-stagehand/api-key
+    template: stagehand-omp-strict
+    guest_omp: /usr/local/bin/omp            # default
+    max_ttl: 1h                              # the instance's -max-ttl
+  model_gateway:
+    listen: 127.0.0.1:43293                  # = the instance's -fc-host-port
+    guest_url: http://10.0.2.2:43293
+    upstream: http://127.0.0.1:43294         # tunnel to gateway-proxy
+```
+
+- **Which models work:** the VM's omp gets only `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`
+  (the token for that attempt), so `anthropic/*` models work through this path.
+- **One stage at a time:** each instance has one host port, so only one agent stage runs at a
+  time. A second one fails to start.
+- **Crash recovery:** after a crash, `serve` destroys every VM that was recorded for an
+  interrupted attempt.
+
+Unit files and an example config are in [`deploy/`](deploy/).
 
 ## How a run works
 
