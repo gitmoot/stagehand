@@ -144,8 +144,9 @@ var migrations = []string{
 		finished_at   TEXT,
 		PRIMARY KEY (run_id, stage_id, attempt)
 	);
-	CREATE INDEX stage_attempts_state ON stage_attempts(state);
-	CREATE TABLE pending_cleanups (
+	CREATE INDEX stage_attempts_state ON stage_attempts(state);`,
+	// 2: cleanup ledger (review round 1).
+	`CREATE TABLE pending_cleanups (
 		resource    TEXT PRIMARY KEY,
 		run_id      INTEGER NOT NULL,
 		stage_id    TEXT NOT NULL,

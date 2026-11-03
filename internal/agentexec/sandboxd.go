@@ -10,11 +10,19 @@ import (
 	"io"
 	"log/slog"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gitmoot/stagehand/internal/modelgw"
 	"github.com/gitmoot/stagehand/internal/sandboxd"
+)
+
+// createWindow bounds a create request; sandboxd's own template-ready limit
+// is 3 minutes. settleMargin covers clock skew and sandboxd's 1s TTL sweep.
+const (
+	createWindow = 5 * time.Minute
+	settleMargin = 5 * time.Minute
 )
 
 const (
@@ -76,36 +84,57 @@ func (s Sandboxd) Run(ctx context.Context, req Request, onLine func([]byte)) (in
 		return 0, err
 	}
 	jobID := "stagehand-" + hex.EncodeToString(jobBytes)
-	resource := sandboxJobPrefix + jobID
 	// Record the job id BEFORE asking for a VM: if the create response is
 	// lost, or the runner dies mid-create, cleanup finds the VM by its
 	// metadata.
+	resource := jobResource(jobID, time.Now(), ttl)
 	if req.Track != nil {
 		if err := req.Track(resource); err != nil {
 			return 0, fmt.Errorf("record sandbox job: %w", err)
 		}
 	}
-	// However Run ends, destroy whatever was created under jobID, confirm it
-	// is gone, and only then release the record. A failure leaves it for the
-	// engine's cleanup sweep.
+	// allocationKnown is true once sandboxd has definitively answered the
+	// create (a VM id, or a 4xx refusal). Until then a VM may still appear.
+	allocationKnown := false
+	// However Run ends, destroy whatever was created under jobID and confirm
+	// it is gone. The record is released only when the allocation is known;
+	// otherwise the engine's cleanup sweep keeps checking until the settle
+	// time recorded in the resource.
 	defer func() {
 		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
 		defer cancel()
-		done, err := s.destroyJob(dctx, jobID)
+		gone, err := s.destroyJob(dctx, jobID)
 		switch {
-		case done && req.Release != nil:
+		case gone && allocationKnown && req.Release != nil:
 			req.Release(resource)
-		case !done && s.Log != nil:
+		case !gone && s.Log != nil:
 			s.Log.Error("sandbox not confirmed destroyed; the cleanup sweep will retry", "job", jobID, "err", err)
+		case !allocationKnown && s.Log != nil:
+			s.Log.Warn("sandbox create outcome unknown; the cleanup sweep keeps checking", "job", jobID)
 		}
 	}()
-	sb, err := s.Client.Create(ctx, sandboxd.CreateRequest{
+	createCtx, cancelCreate := context.WithTimeout(ctx, createWindow)
+	sb, err := s.Client.Create(createCtx, sandboxd.CreateRequest{
 		TemplateID: s.Template,
 		Timeout:    ttl,
 		Metadata: map[string]string{
 			"job_id": jobID, "attempt": "1", "lifecycle_generation": "0", "owner": "stagehand",
 		},
 	})
+	cancelCreate()
+	var refused *sandboxd.HTTPError
+	if err == nil || (errors.As(err, &refused) && refused.Status >= 400 && refused.Status < 500) {
+		// The outcome is definite: swap the record for one without a settle
+		// time, so a confirmed destroy can release it at once. Record the
+		// new one before dropping the old.
+		known := sandboxJobPrefix + jobID
+		if req.Track == nil || req.Track(known) == nil {
+			if req.Release != nil {
+				req.Release(resource)
+			}
+			resource, allocationKnown = known, true
+		}
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -150,15 +179,34 @@ func (s Sandboxd) Run(ctx context.Context, req Request, onLine func([]byte)) (in
 	return code, err
 }
 
-// Cleanup destroys every VM created under a recorded job id and reports done
-// once a complete listing shows none left. A failed list or destroy leaves
-// the record pending, and the engine retries it.
+// Cleanup destroys every VM created under a recorded job id. It reports done
+// once a listing shows none left AND the recorded settle time has passed, so
+// a create that sandboxd completes after the client gave up is still found.
+// A failed list or destroy leaves the record pending, and the engine retries
+// it.
 func (s Sandboxd) Cleanup(ctx context.Context, resource string) (bool, error) {
-	jobID, ok := strings.CutPrefix(resource, sandboxJobPrefix)
+	rest, ok := strings.CutPrefix(resource, sandboxJobPrefix)
 	if !ok {
 		return false, nil
 	}
-	return s.destroyJob(ctx, jobID)
+	jobID, settleText, _ := strings.Cut(rest, "@")
+	gone, err := s.destroyJob(ctx, jobID)
+	if err != nil || !gone {
+		return false, err
+	}
+	settle, perr := strconv.ParseInt(settleText, 10, 64)
+	if perr != nil {
+		return true, nil // no settle time recorded: nothing more can be checked
+	}
+	return time.Now().Unix() >= settle, nil
+}
+
+// jobResource names a sandbox job and the time after which no VM can still
+// appear or live under it: the create can take at most createWindow to
+// settle server-side, and sandboxd destroys every VM at its TTL.
+func jobResource(jobID string, now time.Time, ttl time.Duration) string {
+	settle := now.Add(createWindow + ttl + settleMargin)
+	return fmt.Sprintf("%s%s@%d", sandboxJobPrefix, jobID, settle.Unix())
 }
 
 // destroyJob destroys the VMs whose metadata carries jobID and confirms with

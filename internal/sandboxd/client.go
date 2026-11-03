@@ -92,6 +92,19 @@ func (c *Client) List(ctx context.Context) ([]Sandbox, error) {
 	return nil, errors.New("sandboxd list: too many pages")
 }
 
+// HTTPError is a definite HTTP answer from sandboxd. For create, a 4xx means
+// no VM was allocated; anything else (5xx, a transport error, a cut response)
+// leaves the outcome unknown.
+type HTTPError struct {
+	Op     string
+	Status int
+	Body   string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("sandboxd %s: HTTP %d: %s", e.Op, e.Status, e.Body)
+}
+
 // CreateRequest is a VM to create. Metadata must carry job_id (unique per
 // VM), attempt (>= 1) and lifecycle_generation (>= 0).
 type CreateRequest struct {
@@ -122,7 +135,7 @@ func (c *Client) Create(ctx context.Context, r CreateRequest) (Sandbox, error) {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return Sandbox{}, fmt.Errorf("sandboxd create: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return Sandbox{}, &HTTPError{Op: "create", Status: resp.StatusCode, Body: truncate(raw)}
 	}
 	var sb Sandbox
 	if err := json.Unmarshal(raw, &sb); err != nil || sb.ID == "" || sb.AccessToken == "" {

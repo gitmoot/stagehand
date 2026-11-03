@@ -36,6 +36,8 @@ type fakeSandboxd struct {
 	deleteFails int
 	// truncateCreate allocates the VM but cuts the create response.
 	truncateCreate bool
+	// createDelay allocates only after this long, even if the client left.
+	createDelay time.Duration
 }
 
 func (f *fakeSandboxd) liveCount() int {
@@ -54,6 +56,10 @@ func (f *fakeSandboxd) handler() http.Handler {
 		var body map[string]any
 		json.NewDecoder(r.Body).Decode(&body)
 		meta := body["metadata"].(map[string]any)
+		f.mu.Lock()
+		delay := f.createDelay
+		f.mu.Unlock()
+		time.Sleep(delay)
 		f.mu.Lock()
 		f.created = append(f.created, body)
 		f.live["sandboxd-abc"] = meta["job_id"].(string)
@@ -192,8 +198,9 @@ func TestSandboxdRunsOmpInAFreshVMAndDestroysIt(t *testing.T) {
 		t.Fatalf("%+v", res)
 	}
 	meta := f.created[0]["metadata"].(map[string]any)
-	if len(rec.tracked) != 1 || rec.tracked[0] != "sandboxd-job:"+meta["job_id"].(string) {
-		t.Errorf("tracked %v, want the job id recorded", rec.tracked)
+	job_id := meta["job_id"].(string)
+	if len(rec.tracked) != 2 || !strings.HasPrefix(rec.tracked[0], "sandboxd-job:"+job_id+"@") || rec.tracked[1] != "sandboxd-job:"+job_id {
+		t.Errorf("tracked %v, want the job id recorded before create, then as known", rec.tracked)
 	}
 	if len(rec.pending) != 0 {
 		t.Errorf("pending %v after a confirmed destroy", rec.pending)
@@ -264,14 +271,16 @@ func TestSandboxdUnconfirmedDestroyStaysPending(t *testing.T) {
 	if f.liveCount() != 1 || len(rec.pending) != 1 {
 		t.Fatalf("live %d, pending %v; want the VM alive and its record pending", f.liveCount(), rec.pending)
 	}
-	done, err := be.Cleanup(context.Background(), rec.tracked[0])
+	done, err := be.Cleanup(context.Background(), rec.tracked[len(rec.tracked)-1])
 	if err != nil || !done || f.liveCount() != 0 {
 		t.Fatalf("retry: done=%v err=%v live=%d", done, err, f.liveCount())
 	}
 }
 
 // If the create response is lost, the VM still exists; it carries the job id
-// recorded before the request, so the attempt's own cleanup finds it.
+// recorded before the request, so the attempt's own cleanup finds it. The
+// record stays pending: with the outcome unknown, another VM could still
+// appear until the settle time.
 func TestSandboxdAmbiguousCreateIsCleanedUp(t *testing.T) {
 	f, be, _ := newFake(t)
 	f.truncateCreate = true
@@ -282,11 +291,48 @@ func TestSandboxdAmbiguousCreateIsCleanedUp(t *testing.T) {
 	if res.Outcome != stage.Failed {
 		t.Fatalf("%+v", res)
 	}
-	if len(rec.tracked) != 1 {
-		t.Fatalf("tracked %v; the job id must be recorded before create", rec.tracked)
+	if len(rec.tracked) != 1 || !strings.Contains(rec.tracked[0], "@") {
+		t.Fatalf("tracked %v; the job id and settle time must be recorded before create", rec.tracked)
 	}
-	if f.liveCount() != 0 || len(rec.pending) != 0 {
-		t.Errorf("live %d, pending %v; want the allocated VM found and destroyed", f.liveCount(), rec.pending)
+	if f.liveCount() != 0 {
+		t.Errorf("live %d; the allocated VM must be found and destroyed", f.liveCount())
+	}
+	if !rec.pending[rec.tracked[0]] {
+		t.Errorf("record released while the create outcome is unknown")
+	}
+}
+
+// sandboxd finishes allocating after the client gave up: the record must
+// survive the attempt so a later sweep destroys the late VM.
+func TestSandboxdLateAllocationIsCaughtBySweep(t *testing.T) {
+	f, be, _ := newFake(t)
+	f.createDelay = 400 * time.Millisecond
+	job := newJob(t, 1)
+	var rec recorder
+	rec.attach(&job)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if res := (Executor{Backend: be}).Execute(ctx, job); res.Outcome != stage.Failed {
+		t.Fatalf("%+v", res)
+	}
+	resource := rec.tracked[0]
+	if !rec.pending[resource] {
+		t.Fatal("record released although the create was still in flight")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for f.liveCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if f.liveCount() != 1 {
+		t.Fatal("fake never allocated the late VM")
+	}
+	done, err := be.Cleanup(context.Background(), resource)
+	if err != nil || done || f.liveCount() != 0 {
+		t.Fatalf("sweep before settle: done=%v err=%v live=%d; want the VM destroyed and the record kept", done, err, f.liveCount())
+	}
+	jobID := strings.TrimPrefix(resource[:strings.Index(resource, "@")], "sandboxd-job:")
+	if done, err := be.Cleanup(context.Background(), "sandboxd-job:"+jobID+"@1"); !done || err != nil {
+		t.Errorf("sweep after settle: done=%v err=%v", done, err)
 	}
 }
 
