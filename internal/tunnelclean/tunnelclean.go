@@ -4,7 +4,8 @@
 //
 // A holder is ended only when all of these hold:
 //   - it is an sshd-session listening on exactly the forward's address and port;
-//   - its client connection comes from one of THIS host's addresses;
+//   - its client connection comes from one of THIS host's routable addresses
+//     (never loopback or link-local, which name the far host itself);
 //   - this host has no live TCP connection with that client address and port.
 //
 // So it never touches another host's tunnel, a live tunnel from this host,
@@ -94,7 +95,13 @@ func Holders(listeners, conns string, listen netip.AddrPort) []Session {
 func Stale(holders []Session, ours []netip.Addr, live []Connection) []Session {
 	own := map[netip.Addr]bool{}
 	for _, a := range ours {
-		own[a.Unmap()] = true
+		// Loopback and link-local addresses name the far host itself (or
+		// its link) when they appear in its socket table, never this host,
+		// so they prove nothing about ownership.
+		if a = a.Unmap(); a.IsLoopback() || a.IsLinkLocalUnicast() || a.IsUnspecified() {
+			continue
+		}
+		own[a] = true
 	}
 	alive := map[Connection]bool{}
 	for _, c := range live {
@@ -103,7 +110,7 @@ func Stale(holders []Session, ours []netip.Addr, live []Connection) []Session {
 	var out []Session
 	for _, h := range holders {
 		cli, srv := unmap(h.Client), unmap(h.Server)
-		if !own[cli.Addr()] {
+		if cli.Addr().IsLoopback() || !own[cli.Addr()] {
 			continue
 		}
 		if alive[Connection{Local: cli, Remote: srv}] {

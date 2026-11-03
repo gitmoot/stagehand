@@ -55,3 +55,24 @@ func TestHolderWithoutVisibleConnectionIsLeftAlone(t *testing.T) {
 		t.Fatalf("holders %+v; a holder whose client cannot be identified must not be killed", h)
 	}
 }
+
+// A session on the far host from its own loopback (ssh localhost -R ...)
+// must never pass for this host's, whatever this host's loopback addresses.
+func TestFarHostLoopbackSessionIsNeverStale(t *testing.T) {
+	for _, client := range []string{"127.0.0.1:51000", "[::1]:51000", "[::ffff:127.0.0.1]:51000"} {
+		server := "127.0.0.1:22"
+		if client[0] == '[' {
+			server = "[::1]:22"
+		}
+		conn := "0 0 " + server + " " + client + ` users:(("sshd-session",pid=4242,fd=9))`
+		lst := `LISTEN 0 128 127.0.0.1:43293 0.0.0.0:* users:(("sshd-session",pid=4242,fd=12))`
+		ours := []netip.Addr{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1"), netip.MustParseAddr("100.106.218.88")}
+		h := Holders(lst, conn, listen)
+		if len(h) != 1 {
+			t.Fatalf("%s: holders %+v", client, h)
+		}
+		if s := Stale(h, ours, nil); len(s) != 0 {
+			t.Errorf("%s: a far-host loopback session was marked stale: %+v", client, s)
+		}
+	}
+}
