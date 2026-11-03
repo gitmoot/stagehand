@@ -1,0 +1,35 @@
+# Runner host: links the stagehand runner to the sandboxd instance "stagehand"
+# on hetzner2, where agent VMs run.
+#   -L 127.0.0.1:43292 -> hetzner2 127.0.0.1:43292   sandboxd control and guest API
+#   -R hetzner2 127.0.0.1:43293 -> 127.0.0.1:43293   the guests' only host port
+#                                                    (= sandboxd -fc-host-port), served
+#                                                    by the runner's per-attempt run gateway
+# Modeled on phobos-sandbox-hetzner2-tunnel.service.
+[Unit]
+Description=stagehand tunnel to the hetzner2 sandboxd instance (API 43292, guest gateway 43293)
+Wants=network-online.target tailscaled.service
+After=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+# After a network drop, hetzner2's sshd keeps the dead session (its
+# ClientAliveInterval is 0), and it still holds 43293, so every reconnect
+# fails with "remote port forwarding failed". Before connecting, end an
+# sshd-session holding this unit's own remote port: any such holder is stale,
+# because this unit's previous ssh process is gone. Nothing else is touched.
+# Leading "-": a failure here (host down) must not block the retry loop.
+ExecStartPre=-/usr/bin/ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o IdentityAgent=none -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 root@hetzner2 "for p in $$(ss -Hltnp 'sport = :43293' | grep sshd-session | grep -o 'pid=[0-9]*' | cut -d= -f2); do kill $$p; done"
+ExecStart=/usr/bin/ssh -N -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o IdentityAgent=none -o ControlMaster=no -o ControlPath=none -o ExitOnForwardFailure=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -L 127.0.0.1:43292:127.0.0.1:43292 -R 127.0.0.1:43293:127.0.0.1:43293 root@hetzner2
+Restart=always
+RestartSec=5
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

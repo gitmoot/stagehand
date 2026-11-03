@@ -1,5 +1,5 @@
-# Fleet host (holds the omp auth-gateway token): adds the gateway bearer to
-# model calls arriving from the hetzner2 tunnel. Loopback only.
+# Runner host (holds the omp auth-gateway token): adds the gateway bearer to
+# agents' model calls coming from the per-attempt run gateway. Loopback only.
 [Unit]
 Description=stagehand model credential proxy
 After=network-online.target

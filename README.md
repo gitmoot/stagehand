@@ -138,10 +138,14 @@ uid 1000), and the VM is destroyed afterwards.
   attempt. It accepts only that attempt's random token, removes it, and forwards the call.
 - **Credentials:** the real model credential is added further along, by
   `stagehand gateway-proxy`, on the host that holds the omp auth-gateway token.
+- **Where things run:** the runner (and so the shell stages) runs next to the data its shell
+  stages need. The sandboxd instance can be on another host: one ssh tunnel forwards its API to
+  the runner (`-L`) and its guest host port back to the runner's run gateway (`-R`).
 
 ```
-guest omp ── token for this attempt ──▶ run gateway (stagehand serve, 127.0.0.1:43293)
-          ──▶ 127.0.0.1:43294 (ssh -R tunnel) ──▶ stagehand gateway-proxy (127.0.0.1:43295, adds bearer)
+guest omp ── token for this attempt ──▶ 10.0.2.2:43293 (sandbox host's -fc-host-port)
+          ──▶ ssh -R ──▶ run gateway (stagehand serve on the runner host, 127.0.0.1:43293)
+          ──▶ stagehand gateway-proxy (127.0.0.1:43295, adds bearer)
           ──▶ omp auth-gateway (127.0.0.1:4011) ──▶ provider
 ```
 
@@ -149,15 +153,15 @@ guest omp ── token for this attempt ──▶ run gateway (stagehand serve, 
 agent:
   executor: sandboxd
   sandboxd:
-    url: http://127.0.0.1:43292              # the instance's -listen
-    api_key_file: /var/lib/sandboxd-stagehand/api-key
+    url: http://127.0.0.1:43292              # the instance's -listen (via the tunnel's -L)
+    api_key_file: /etc/stagehand/sandboxd-api-key
     template: stagehand-omp-strict
     guest_omp: /usr/local/bin/omp            # default
     max_ttl: 1h                              # the instance's -max-ttl
   model_gateway:
-    listen: 127.0.0.1:43293                  # = the instance's -fc-host-port
+    listen: 127.0.0.1:43293                  # reached from the instance's -fc-host-port (tunnel -R)
     guest_url: http://10.0.2.2:43293
-    upstream: http://127.0.0.1:43294         # tunnel to gateway-proxy
+    upstream: http://127.0.0.1:43295         # stagehand gateway-proxy
 ```
 
 - **Which models work:** the VM's omp gets only `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`
@@ -308,8 +312,9 @@ binary refuses a newer schema rather than misreading it (`database schema versio
 this binary supports`). Rolling back across a schema change therefore needs the database file
 backed up before the upgrade.
 
-The model tunnel (`deploy/stagehand-model-tunnel.service`) reconnects on its own after a network
-drop. Before each connection, it ends a stale session that still holds its port on the far side.
+The sandbox tunnel (`deploy/stagehand-hetzner2-tunnel.service`) reconnects on its own after a
+network drop. Before each connection, it ends a stale session that still holds its port on the far
+side.
 
 ## Development
 
