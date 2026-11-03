@@ -163,7 +163,8 @@ agent:
 - **Which models work:** the VM's omp gets only `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`
   (the token for that attempt), so `anthropic/*` models work through this path.
 - **One stage at a time:** each instance has one host port, so only one agent stage runs at a
-  time. A second one fails to start.
+  time. Agent stages that become ready meanwhile, in any pipeline, wait as `pending` and start
+  when the slot frees; their time limit starts only then.
 - **Crash recovery:** the sandbox job id is recorded before the VM is requested. Cleanup finds
   VMs by that id in the instance's inventory, so even a VM whose create response was lost gets
   destroyed.
