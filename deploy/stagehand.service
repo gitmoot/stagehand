@@ -1,15 +1,15 @@
-# hetzner2: the runner. Agent stages run in the sandboxd instance "stagehand";
-# shell stages run here as root.
+# Runner host (next to the data the shell stages use). Agent stages run in the
+# sandboxd instance "stagehand" on hetzner2 via stagehand-hetzner2-tunnel.
 [Unit]
 Description=stagehand pipeline runner
-After=network-online.target sandboxd-stagehand.service
-Wants=network-online.target
+After=network-online.target stagehand-hetzner2-tunnel.service stagehand-gateway-proxy.service
+Wants=network-online.target stagehand-hetzner2-tunnel.service stagehand-gateway-proxy.service
 
 [Service]
 Type=simple
 Environment=STAGEHAND_HOME=/var/lib/stagehand
 Environment=STAGEHAND_CONFIG=/etc/stagehand/config.yaml
-ExecStart=/usr/local/bin/stagehand serve --status-addr 127.0.0.1:8795
+ExecStart=/usr/local/bin/stagehand serve --status-addr 127.0.0.1:8797
 Restart=on-failure
 RestartSec=10
 # Stop sends SIGTERM: running stages are stopped and their runs parked as
