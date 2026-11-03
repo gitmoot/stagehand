@@ -52,6 +52,9 @@ type Engine struct {
 	// liveResources are tracked by attempts still running in this process;
 	// the cleanup sweep leaves them alone.
 	liveResources map[string]bool
+	// running counts attempts in flight per stage kind, for executors with
+	// a concurrency limit (stage.Limiter).
+	running map[spec.Kind]int
 	// stopping is set once Loop is shutting down; advance then only folds
 	// results and never starts a stage.
 	stopping atomic.Bool
@@ -80,6 +83,7 @@ func New(st *store.Store, home string, executors map[spec.Kind]stage.Executor, b
 		Poll:          DefaultPoll,
 		inflight:      map[flightKey]context.CancelCauseFunc{},
 		liveResources: map[string]bool{},
+		running:       map[spec.Kind]int{},
 		wake:          make(chan struct{}, 1),
 	}
 }
@@ -404,6 +408,28 @@ func (e *Engine) stopAll(only map[int64]bool) {
 	if _, err := e.advanceAll(ctx, only); err != nil {
 		e.Log.Error("final advance", "err", err)
 	}
+}
+
+// reserve takes an execution slot for a stage of kind, if its executor's
+// limit allows one more. Every successful reserve is paired with unreserve.
+func (e *Engine) reserve(kind spec.Kind) bool {
+	limit := 0
+	if l, ok := e.Executors[kind].(stage.Limiter); ok {
+		limit = l.MaxConcurrent()
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if limit > 0 && e.running[kind] >= limit {
+		return false
+	}
+	e.running[kind]++
+	return true
+}
+
+func (e *Engine) unreserve(kind spec.Kind) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.running[kind]--
 }
 
 func (e *Engine) isInflight(k flightKey) bool {

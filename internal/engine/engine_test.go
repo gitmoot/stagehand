@@ -652,3 +652,56 @@ func TestScheduleJSONUsesDocumentedKeys(t *testing.T) {
 		t.Errorf("schedule JSON %s", raw)
 	}
 }
+
+// limitedExec allows one attempt at a time and fails any attempt that
+// overlaps another, like a second run gateway on the one sandbox host port.
+type limitedExec struct {
+	mu      sync.Mutex
+	active  int
+	overlap bool
+	ran     int
+}
+
+func (l *limitedExec) MaxConcurrent() int { return 1 }
+
+func (l *limitedExec) Execute(ctx context.Context, job stage.Job) stage.Result {
+	l.mu.Lock()
+	l.active++
+	clash := l.active > 1
+	l.overlap = l.overlap || clash
+	l.ran++
+	l.mu.Unlock()
+	defer func() { l.mu.Lock(); l.active--; l.mu.Unlock() }()
+	if clash {
+		return stage.Result{Outcome: stage.Failed, Summary: "address already in use"}
+	}
+	time.Sleep(50 * time.Millisecond)
+	return stage.Result{Outcome: stage.Succeeded}
+}
+
+// Agent stages of different pipelines wait for the executor's slot instead
+// of failing; the waiting run is neither started early nor settled.
+func TestLimitedExecutorQueuesStagesAcrossRuns(t *testing.T) {
+	h := newHarness(t, nil)
+	lim := &limitedExec{}
+	h.eng.Executors[spec.KindAgent] = lim
+	agent := func(name string) string {
+		return "name: " + name + "\nstages:\n  - {id: r, agent: omp, prompt: x, output: o.json, max_cost: 1, timeout: 1m}\n"
+	}
+	h.add(agent("p1"), false)
+	h.add(agent("p2"), false)
+	r1, r2 := h.start("p1"), h.start("p2")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := h.eng.Loop(ctx, LoopOptions{Only: map[int64]bool{r1: true, r2: true}, UntilIdle: true}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int64{r1, r2} {
+		if d, _ := h.eng.Run(context.Background(), id); d.State != store.RunSucceeded {
+			t.Errorf("run %d: %s (%s)", id, d.State, d.HaltReason)
+		}
+	}
+	if lim.overlap || lim.ran != 2 {
+		t.Errorf("overlap=%v ran=%d; want two sequential attempts", lim.overlap, lim.ran)
+	}
+}

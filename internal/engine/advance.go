@@ -115,6 +115,7 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 	}
 
 	// Start every pending stage whose needs all succeeded.
+	waiting := false
 	state := map[string]string{}
 	for _, st := range stages {
 		state[st.StageID] = st.State
@@ -146,13 +147,23 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 			// next runner picks it up from here.
 			return true, nil
 		}
-		if err := e.start(ctx, run, sp, stg, st); err != nil {
+		if !e.reserve(stg.Kind()) {
+			// The executor is at its limit (e.g. one sandbox at a time):
+			// stay pending, and keep the run open until a slot frees.
+			waiting = true
+			continue
+		}
+		launched, err := e.start(ctx, run, sp, stg, st)
+		if !launched {
+			e.unreserve(stg.Kind())
+		}
+		if err != nil {
 			return true, err
 		}
 		state[st.StageID] = store.StageRunning
 		running++
 	}
-	if running > 0 {
+	if running > 0 || waiting {
 		return true, nil
 	}
 
@@ -209,8 +220,9 @@ func (e *Engine) foldStage(ctx context.Context, st *store.RunStage, state, summa
 	return e.Store.UpdateStage(ctx, *st)
 }
 
-// start records a new attempt for st and launches it.
-func (e *Engine) start(ctx context.Context, run store.Run, sp spec.Spec, stg spec.Stage, st *store.RunStage) error {
+// start records a new attempt for st and launches it. launched reports
+// whether its goroutine is running (and now owns the execution slot).
+func (e *Engine) start(ctx context.Context, run store.Run, sp spec.Spec, stg spec.Stage, st *store.RunStage) (launched bool, err error) {
 	now := e.now()
 	st.Attempts++
 	if st.StartedAt == nil {
@@ -223,17 +235,17 @@ func (e *Engine) start(ctx context.Context, run store.Run, sp spec.Spec, stg spe
 	a := store.Attempt{RunID: run.ID, StageID: stg.ID, Attempt: st.Attempts, State: store.AttemptRunning, LogPath: logPath, StartedAt: now}
 	if err := e.Store.StartAttempt(ctx, *st, a); err != nil {
 		st.Attempts--
-		return err
+		return false, err
 	}
 	st.State = store.StageRunning
 
-	fail := func(summary string) error {
+	fail := func(summary string) (bool, error) {
 		end := e.now()
 		a.State, a.Summary, a.FinishedAt = store.AttemptFailed, summary, &end
 		e.Log.Error("stage could not start", "run", run.ID, "stage", stg.ID, "err", summary)
 		err := e.Store.FinishAttempt(ctx, a)
 		e.signal()
-		return err
+		return false, err
 	}
 	for _, d := range []string{workDir, filepath.Dir(logPath), filepath.Dir(resultPath)} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
@@ -318,13 +330,14 @@ func (e *Engine) start(ctx context.Context, run store.Run, sp spec.Spec, stg spe
 
 		e.mu.Lock()
 		delete(e.inflight, key)
+		e.running[stg.Kind()]--
 		for _, r := range tracked {
 			delete(e.liveResources, r)
 		}
 		e.mu.Unlock()
 		e.signal()
 	}()
-	return nil
+	return true, nil
 }
 
 func exitString(code *int) string {

@@ -174,6 +174,14 @@ func (x Executor) Execute(ctx context.Context, job stage.Job) stage.Result {
 	return finish(stage.Succeeded, fmt.Sprintf("wrote %s (%d bytes)", st.Output, len(doc)))
 }
 
+// MaxConcurrent forwards the backend's limit, if it has one.
+func (x Executor) MaxConcurrent() int {
+	if l, ok := x.Backend.(stage.Limiter); ok {
+		return l.MaxConcurrent()
+	}
+	return 0
+}
+
 // Cleanup forwards crash recovery to the backend, if it starts anything.
 func (x Executor) Cleanup(ctx context.Context, resource string) (bool, error) {
 	if c, ok := x.Backend.(stage.Cleaner); ok {
