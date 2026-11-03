@@ -55,6 +55,8 @@ Service:
   tick                                     one pass: fire due schedules, run them to the end
   gateway-proxy [--listen ADDR] [--upstream URL] [--token-file FILE]
                                            model credential proxy for sandboxed agent stages
+  tunnel-clear-stale --ssh-host HOST --remote-listen ADDR:PORT
+                                           end this host's dead ssh session still holding a forward
   status [--json]                          last and next run per pipeline
   version
 
@@ -95,6 +97,14 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if cmd == "tunnel-clear-stale" {
+		// Runs before a tunnel reconnects; needs no home.
+		if err := tunnelClearStale(ctx, cmdArgs, stdout, stderr); err != nil {
+			fmt.Fprintln(stderr, "stagehand:", err)
+			return 1
+		}
+		return 0
+	}
 	if cmd == "gateway-proxy" {
 		// Runs on the host holding the omp auth-gateway token; needs no home.
 		if err := gatewayProxy(ctx, cmdArgs, stderr); err != nil {

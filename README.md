@@ -313,8 +313,11 @@ this binary supports`). Rolling back across a schema change therefore needs the 
 backed up before the upgrade.
 
 The sandbox tunnel (`deploy/stagehand-hetzner2-tunnel.service`) reconnects on its own after a
-network drop. Before each connection, it ends a stale session that still holds its port on the far
-side.
+network drop. Before each connection, `stagehand tunnel-clear-stale` ends a session on the far side
+that still holds the forwarded port, but only one it can prove is this host's own dead
+connection. That means an sshd-session on exactly that address and port, whose client is this host
+and whose TCP connection no longer exists here. Live sessions and other hosts' sessions are left
+alone.
 
 ## Development
 
