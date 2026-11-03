@@ -1,0 +1,22 @@
+# hetzner2: the runner. Agent stages run in the sandboxd instance "stagehand";
+# shell stages run here as root.
+[Unit]
+Description=stagehand pipeline runner
+After=network-online.target sandboxd-stagehand.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=STAGEHAND_HOME=/var/lib/stagehand
+Environment=STAGEHAND_CONFIG=/etc/stagehand/config.yaml
+ExecStart=/usr/local/bin/stagehand serve --status-addr 127.0.0.1:8795
+Restart=on-failure
+RestartSec=10
+# Stop sends SIGTERM: running stages are stopped and their runs parked as
+# interrupted. control-group also kills anything a crashed runner left.
+KillMode=control-group
+TimeoutStopSec=60
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

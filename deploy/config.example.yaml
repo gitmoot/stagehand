@@ -1,0 +1,13 @@
+# /etc/stagehand/config.yaml on hetzner2
+agent:
+  executor: sandboxd
+  sandboxd:
+    url: http://127.0.0.1:43292
+    api_key_file: /var/lib/sandboxd-stagehand/api-key
+    template: stagehand-omp-strict
+    guest_omp: /usr/local/bin/omp
+    max_ttl: 1h
+  model_gateway:
+    listen: 127.0.0.1:43293          # = sandboxd -fc-host-port; the guest sees 10.0.2.2:43293
+    guest_url: http://10.0.2.2:43293
+    upstream: http://127.0.0.1:43294 # stagehand-model-tunnel -> gateway-proxy on the fleet host

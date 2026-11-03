@@ -1,0 +1,24 @@
+# Fleet host: exposes the credential proxy on hetzner2 as 127.0.0.1:43294,
+# where the stagehand run gateway forwards agents' model calls.
+# Modeled on phobos-sandbox-hetzner2-tunnel.service.
+[Unit]
+Description=stagehand model tunnel: hetzner2 127.0.0.1:43294 -> this host 127.0.0.1:43295
+Wants=network-online.target tailscaled.service stagehand-gateway-proxy.service
+After=network-online.target tailscaled.service stagehand-gateway-proxy.service
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+ExecStart=/usr/bin/ssh -N -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o IdentityAgent=none -o ControlMaster=no -o ControlPath=none -o ExitOnForwardFailure=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -R 127.0.0.1:43294:127.0.0.1:43295 root@hetzner2
+Restart=always
+RestartSec=5
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

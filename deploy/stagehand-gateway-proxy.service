@@ -1,0 +1,19 @@
+# Fleet host (holds the omp auth-gateway token): adds the gateway bearer to
+# model calls arriving from the hetzner2 tunnel. Loopback only.
+[Unit]
+Description=stagehand model credential proxy
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/stagehand gateway-proxy --listen 127.0.0.1:43295 --upstream http://127.0.0.1:4011 --token-file /root/.omp/auth-gateway.token
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
