@@ -296,6 +296,21 @@ WantedBy=multi-user.target
 - **Crashes:** `KillMode=control-group` makes systemd kill any stage processes left behind if the
   runner crashes.
 
+### Upgrading and rolling back
+
+1. Check that nothing is running: `stagehand status --json` shows `active_run_id: null` for every pipeline.
+2. Put the new binary next to the old one, then `mv` it over `/usr/local/bin/stagehand`. Renaming
+   on the same filesystem is atomic and avoids "text file busy".
+3. `systemctl restart stagehand`, then check `stagehand version` and `GET /status`.
+
+To roll back, do the same with the previous binary. The database only gets new migrations: an older
+binary refuses a newer schema rather than misreading it (`database schema version N is newer than
+this binary supports`). Rolling back across a schema change therefore needs the database file
+backed up before the upgrade.
+
+The model tunnel (`deploy/stagehand-model-tunnel.service`) reconnects on its own after a network
+drop. Before each connection, it ends a stale session that still holds its port on the far side.
+
 ## Development
 
 ```sh
