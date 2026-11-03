@@ -179,6 +179,10 @@ func (s Sandboxd) Run(ctx context.Context, req Request, onLine func([]byte)) (in
 	return code, err
 }
 
+// MaxConcurrent is 1: the instance exposes one host port, which one run
+// gateway at a time listens on.
+func (Sandboxd) MaxConcurrent() int { return 1 }
+
 // Cleanup destroys every VM created under a recorded job id. It reports done
 // once a listing shows none left AND the recorded settle time has passed, so
 // a create that sandboxd completes after the client gave up is still found.

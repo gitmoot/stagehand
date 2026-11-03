@@ -79,3 +79,10 @@ type Executor interface {
 type Cleaner interface {
 	Cleanup(ctx context.Context, resource string) (done bool, err error)
 }
+
+// Limiter is implemented by executors that can run only a limited number of
+// attempts at once (a sandboxd instance has one host port). The engine keeps
+// further ready stages pending until a slot frees. Zero means no limit.
+type Limiter interface {
+	MaxConcurrent() int
+}
