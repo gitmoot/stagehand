@@ -10,6 +10,14 @@ After=network-online.target tailscaled.service stagehand-gateway-proxy.service
 Type=simple
 User=root
 UMask=0077
+# After a network drop, hetzner2's sshd keeps the dead session (its
+# ClientAliveInterval is 0), and that session still holds 43294, so every
+# reconnect fails with "remote port forwarding failed". Before connecting,
+# end an sshd-session that holds this unit's own port: any holder is stale,
+# because this unit's previous ssh process is gone. Other ports and other
+# processes are never touched. Leading "-": a failure here (host down) must
+# not block the retry loop.
+ExecStartPre=-/usr/bin/ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o IdentityAgent=none -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 root@hetzner2 "for p in $$(ss -Hltnp 'sport = :43294' | grep sshd-session | grep -o 'pid=[0-9]*' | cut -d= -f2); do kill $$p; done"
 ExecStart=/usr/bin/ssh -N -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o IdentityAgent=none -o ControlMaster=no -o ControlPath=none -o ExitOnForwardFailure=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -R 127.0.0.1:43294:127.0.0.1:43295 root@hetzner2
 Restart=always
 RestartSec=5
