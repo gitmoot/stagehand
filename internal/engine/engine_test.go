@@ -480,7 +480,7 @@ func TestShellStageEnvIsExact(t *testing.T) {
 		t.Fatal(err)
 	}
 	e := &Engine{BaseEnv: []string{"PATH=/bin"}}
-	env, err := e.stageEnv(store.Run{ID: 7, Pipeline: "p"}, sp, sp.Stages[0], 1, "/w", "/r.json")
+	env, err := e.stageEnv(store.Run{ID: 7, Pipeline: "p"}, nil, sp, sp.Stages[0], 1, "/w", "/r.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,7 +499,7 @@ func TestShellStageEnvIsExact(t *testing.T) {
 	}
 
 	sp.Stages[0].EnvKeys = []string{"MISSING"}
-	if _, err := e.stageEnv(store.Run{}, sp, sp.Stages[0], 1, "/w", "/r"); err == nil {
+	if _, err := e.stageEnv(store.Run{}, nil, sp, sp.Stages[0], 1, "/w", "/r"); err == nil {
 		t.Error("missing env key did not fail")
 	}
 }

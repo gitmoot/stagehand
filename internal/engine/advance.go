@@ -176,7 +176,17 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 	}
 	if allOK {
 		e.Log.Info("run succeeded", "run", run.ID)
-		return false, e.Store.FinishRun(ctx, run.ID, store.RunSucceeded, "", "", e.now())
+		if err := e.Store.FinishRun(ctx, run.ID, store.RunSucceeded, "", "", e.now()); err != nil {
+			return false, err
+		}
+		if run.EventID != 0 {
+			// Retention (owner, 6 Nov): a succeeded event run's payload and
+			// files go at once. A failure here is retried by the sweep.
+			if err := e.deleteRunFiles(ctx, run.ID); err != nil {
+				e.Log.Error("retention; the sweep will retry", "run", run.ID, "err", err)
+			}
+		}
+		return false, nil
 	}
 	final := store.RunBlocked
 	var haltStage, haltReason string
@@ -259,7 +269,18 @@ func (e *Engine) start(ctx context.Context, run store.Run, sp spec.Spec, stg spe
 	var env []string
 	if stg.Kind() == spec.KindShell {
 		var err error
-		if env, err = e.stageEnv(run, sp, stg, st.Attempts, workDir, resultPath); err != nil {
+		var ev *store.Event
+		if run.EventID != 0 {
+			got, err := e.Store.GetEvent(ctx, run.EventID)
+			if err != nil {
+				return fail("load event: " + err.Error())
+			}
+			if got.PayloadDeletedAt != nil {
+				return fail("the event's payload was deleted; this run cannot continue")
+			}
+			ev = &got
+		}
+		if env, err = e.stageEnv(run, ev, sp, stg, st.Attempts, workDir, resultPath); err != nil {
 			return fail(err.Error())
 		}
 	}
@@ -355,7 +376,7 @@ func firstLine(s string) string {
 // stageEnv builds a shell stage's complete environment: BaseEnv, the
 // STAGEHAND_* variables, then each env_keys entry from env_file (preferred) or
 // the spec's env defaults. A listed key found in neither is an error.
-func (e *Engine) stageEnv(run store.Run, sp spec.Spec, stg spec.Stage, attempt int, workDir, resultPath string) ([]string, error) {
+func (e *Engine) stageEnv(run store.Run, ev *store.Event, sp spec.Spec, stg spec.Stage, attempt int, workDir, resultPath string) ([]string, error) {
 	vars := map[string]string{}
 	var order []string
 	set := func(k, v string) {
@@ -375,6 +396,14 @@ func (e *Engine) stageEnv(run store.Run, sp spec.Spec, stg spec.Stage, attempt i
 	set("STAGEHAND_ATTEMPT", fmt.Sprint(attempt))
 	set("STAGEHAND_WORK", workDir)
 	set("STAGEHAND_RESULT", resultPath)
+	set("STAGEHAND_TRIGGER", run.Trigger)
+	if ev != nil {
+		// The payload is passed only as a path: stagehand never puts event
+		// content into a command line or environment value.
+		set("STAGEHAND_EVENT_ID", ev.Key)
+		set("STAGEHAND_EVENT_FILE", ev.PayloadPath)
+		set("STAGEHAND_EVENT_CONTENT_TYPE", ev.ContentType)
+	}
 	if len(stg.EnvKeys) > 0 {
 		var secrets map[string]string
 		if sp.EnvFile != "" {
@@ -424,6 +453,16 @@ func (e *Engine) schedule(ctx context.Context) error {
 		}
 		if active {
 			continue // fire as soon as the active run settles
+		}
+		if sp.Events != nil {
+			ev, err := e.Store.OldestQueuedEvent(ctx, p.Name)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			if eventBeforeSchedule(ev, p) {
+				continue // an older event goes first; the schedule stays due
+			}
 		}
 		if _, err := e.createRun(ctx, p, sp, "schedule"); err != nil && !errors.Is(err, store.ErrActiveRun) {
 			errs = append(errs, err)

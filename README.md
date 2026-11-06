@@ -54,6 +54,7 @@ stages:
 | `schedule.interval` | Go duration, at least `1m`. Without a schedule, the pipeline runs only on demand |
 | `schedule.jitter` | Random extra delay before each due time, from 0 up to (not including) `jitter`. Must be smaller than `interval` |
 | `schedule.at` | RFC 3339 time. Due times become `at + k*interval` |
+| `events.max_queued` | Opt in to event triggers; at most this many events wait (see [Starting pipelines from events](#starting-pipelines-from-events)) |
 | `env_file` | Absolute path to a `KEY=VALUE` file of secrets. It must be private (mode `0600`) |
 | `env` | Non-secret default values |
 | `stages` | The stages |
@@ -190,6 +191,7 @@ Unit files and an example config are in [`deploy/`](deploy/).
   - `STAGEHAND_PIPELINE`, `STAGEHAND_RUN_ID`, `STAGEHAND_STAGE`, `STAGEHAND_ATTEMPT`;
   - `STAGEHAND_WORK`, the run's shared work directory, where stages pass files to each other;
   - `STAGEHAND_RESULT`;
+  - `STAGEHAND_TRIGGER`, and for event runs `STAGEHAND_EVENT_ID`, `STAGEHAND_EVENT_FILE`, `STAGEHAND_EVENT_CONTENT_TYPE`;
   - the variables in its `env_keys`, and nothing else.
 - **A failed or blocked stage parks the run.** Stages that depend on it are skipped. Stages that
   don't depend on it still finish. The run ends as `failed` or `blocked`.
@@ -214,6 +216,135 @@ Unit files and an example config are in [`deploy/`](deploy/).
 - **Stopping:** on `SIGTERM`, stagehand stops the running stages and starts nothing new. A run
   whose next stage was ready stays `running`, and the next runner continues it.
 
+## Starting pipelines from events
+
+A pipeline can also be started by something that happens outside stagehand, for example a mail
+poller seeing a new message or a webhook receiver getting a call. Each accepted event queues one
+run, and its payload becomes that run's input. Receivers live outside stagehand; they just call the
+trigger.
+
+```yaml
+name: deck-review
+events:
+  max_queued: 20        # opt in; at most 20 events wait, more are refused
+schedule: {interval: 24h}   # optional: schedule and events can share a pipeline
+stages:
+  - id: intake
+    cmd: cp "$STAGEHAND_EVENT_FILE" "$STAGEHAND_WORK/mail.eml"
+  - id: score
+    needs: [intake]
+    agent: omp
+    inputs: [mail.eml]
+    # …
+```
+
+**How events run**
+- Runs start in arrival order. A pipeline still has at most one running run at a time, and agent
+  stages still share the sandbox one at a time.
+- When `max_queued` events are already waiting, a new trigger is refused and nothing is stored, so
+  the caller knows to retry. Accepted events are never lost or run twice.
+- A disabled pipeline refuses events; its queued events wait until it is enabled again.
+- **Schedule and events on one pipeline:** whichever has waited longer gets the next run, the due
+  schedule or the oldest queued event. A schedule that is due again every time a run ends cannot
+  starve events, and a stream of events cannot starve the schedule.
+
+**What a stage sees.** The payload is passed **only as a file**. stagehand never puts event content
+into a command line or an environment value. Shell stages get:
+
+| Variable | Value |
+|---|---|
+| `STAGEHAND_TRIGGER` | `event`, `schedule` or `manual` |
+| `STAGEHAND_EVENT_ID` | the event id (the caller's, or a generated one) |
+| `STAGEHAND_EVENT_FILE` | path to the payload, exactly the bytes received |
+| `STAGEHAND_EVENT_CONTENT_TYPE` | the sender's media type, if it was well formed |
+
+Agent stages see the payload only if a shell stage copies it into `$STAGEHAND_WORK` and lists it in
+`inputs`.
+
+**Idempotency.** Send an event id. The same id for the same pipeline always gives one event and one
+run, so a webhook that retries cannot start duplicates. Without an id, every trigger is a new
+event. Ids are 1–128 characters from `A-Z a-z 0-9 . _ : -`.
+
+### HTTP trigger
+
+`stagehand serve --trigger-addr 127.0.0.1:8798` serves `POST /v1/pipelines/{name}/events`.
+
+- **Address:** loopback only, unless `--trigger-allow-remote` is also given. Put a TLS proxy in
+  front of it before exposing it.
+- **Body:** the raw payload.
+- **Authentication:** every request must be signed with HMAC-SHA256, using the key in the host
+  config's `events.secret_file` (a 0600 file):
+
+```
+X-Stagehand-Timestamp: <unix seconds, within 5 minutes of the runner's clock>
+X-Stagehand-Event-Id:  <optional idempotency key>
+X-Stagehand-Signature: sha256=<hex HMAC-SHA256(key, timestamp "\n" pipeline "\n" event_id "\n" body)>
+```
+
+```sh
+KEY=$(cat /etc/stagehand/trigger.key); TS=$(date +%s); ID=msg-123
+SIG=$( { printf '%s\n%s\n%s\n' "$TS" deck-review "$ID"; cat mail.eml; } | openssl dgst -sha256 -hmac "$KEY" -r | cut -d' ' -f1)
+curl -sS -X POST http://127.0.0.1:8798/v1/pipelines/deck-review/events \
+  -H "X-Stagehand-Timestamp: $TS" -H "X-Stagehand-Event-Id: $ID" -H "X-Stagehand-Signature: sha256=$SIG" \
+  -H 'Content-Type: message/rfc822' --data-binary @mail.eml
+```
+
+| Status | Meaning |
+|---|---|
+| 202 | Accepted and queued (JSON gives the event id, size and SHA-256) |
+| 200 | Duplicate: this event id was already received; the original event and its run are returned |
+| 401 | Missing, stale or wrong signature |
+| 404 | No such pipeline, or it has no `events:` block |
+| 409 | Pipeline disabled |
+| 413 | Payload larger than `events.max_payload_bytes` (default 64 MiB) |
+| 429 | Queue full (`Retry-After: 60`); nothing was stored |
+
+### CLI trigger
+
+```sh
+stagehand trigger deck-review --event-id msg-123 --payload-file mail.eml [--content-type message/rfc822] [--wait] [--json]
+```
+
+- Reads the payload from stdin if `--payload-file` is not given.
+- Needs no signature: whoever can run it can already read the home.
+- `--wait` waits for the event's run and exits non-zero unless it succeeded. If no `serve` is
+  running, it runs its own pipeline's queued events itself (in order, up to and including this
+  one) and returns as soon as this event's run ends.
+
+Related commands:
+
+| Command | What it does |
+|---|---|
+| `events [--pipeline N] [--state queued]` | Lists accepted events |
+| `drop-event <id>` | Discards a queued event and its payload |
+| `status --json` | Shows `queued_events` for each pipeline |
+| `show <run-id>` | Shows the run's event: id, source, size, SHA-256; never the payload |
+
+### Payload retention
+
+Payloads can be confidential (for example, mail with attachments).
+
+- **What is kept:** an event's payload, and the files of its run (work, logs, results), while the
+  event is queued and while its run is running or parked, so a parked run can be resumed.
+- **When it is deleted:** as soon as the run **succeeds**. The run's database record stays: states,
+  exit codes, cost and summaries.
+- **Purging a parked run:** `stagehand purge <run-id>` deletes a parked event run's files and payload
+  once it will not be resumed; after that it cannot be resumed.
+- **Crash safety:** a deletion is recorded in the database before any file is removed, so it can
+  never race a resume. A deletion interrupted by a crash is finished by the next clean-up sweep,
+  at start-up and every minute. Payload files no event refers to are removed by the same sweep.
+  An intake holds a lock on its file until its event is committed, and the sweep never removes a
+  file it cannot lock, so an intake in progress is never touched, however long its sender took.
+
+### Host settings
+
+```yaml
+# runner config
+events:
+  secret_file: /etc/stagehand/trigger.key   # required for --trigger-addr; 0600
+  max_payload_bytes: 67108864               # default 64 MiB
+```
+
 ## Commands
 
 ```
@@ -228,9 +359,13 @@ run <name> [--wait] [--json]             start a run
 runs <name> [--limit N] [--json]         newest runs of a pipeline
 resume <run-id> [--from STAGE] [--wait]  re-run a parked run from a stage
 cancel <run-id>                          stop a running run
-serve [--status-addr 127.0.0.1:PORT]     run schedules and stages until stopped
-tick                                     one pass: fire due schedules, run them to the end
+serve [--status-addr ADDR] [--trigger-addr ADDR]   run schedules, events and stages until stopped
+tick                                     one pass: fire due schedules and queued events, run them to the end
 status [--json]                          last and next run per pipeline
+trigger <name> [--event-id ID] [--payload-file F] [--wait]   queue an event run
+events [--pipeline N] [--state S] [--json]                   accepted events
+drop-event <event-id>                    discard a queued event and its payload
+purge <run-id>                           delete a finished event run's files and payload
 version
 ```
 
@@ -262,6 +397,7 @@ version
       "schedule": {"interval": "24h", "jitter": "10m"},
       "next_due_at": "2026-11-04T03:04:12Z",
       "active_run_id": null,
+      "queued_events": 0,
       "last_run": {
         "id": 12, "trigger": "schedule", "state": "succeeded",
         "created_at": "2026-11-03T03:02:00Z", "finished_at": "2026-11-03T03:09:41Z",

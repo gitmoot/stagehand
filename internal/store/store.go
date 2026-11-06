@@ -155,6 +155,25 @@ var migrations = []string{
 		tries       INTEGER NOT NULL DEFAULT 0,
 		last_error  TEXT NOT NULL DEFAULT ''
 	);`,
+	// 3: event triggers (#18).
+	`CREATE TABLE events (
+		id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+		pipeline           TEXT NOT NULL,
+		event_key          TEXT NOT NULL,
+		state              TEXT NOT NULL,
+		source             TEXT NOT NULL,
+		received_at        TEXT NOT NULL,
+		content_type       TEXT NOT NULL DEFAULT '',
+		payload_path       TEXT NOT NULL DEFAULT '',
+		payload_bytes      INTEGER NOT NULL DEFAULT 0,
+		payload_sha256     TEXT NOT NULL DEFAULT '',
+		payload_deleted_at TEXT,
+		run_id             INTEGER,
+		UNIQUE (pipeline, event_key)
+	);
+	CREATE INDEX events_queue ON events(pipeline, state, id);
+	ALTER TABLE runs ADD COLUMN event_id INTEGER;
+	ALTER TABLE runs ADD COLUMN files_deleted_at TEXT;`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -314,6 +333,11 @@ type Run struct {
 	CancelRequested bool
 	CreatedAt       time.Time
 	FinishedAt      *time.Time
+	// EventID is the events row that started this run (0 if none).
+	EventID int64
+	// FilesDeletedAt is when the run's directory and payload were deleted
+	// (retention); such a run can no longer be resumed.
+	FilesDeletedAt *time.Time
 }
 
 // RunStage is the state of one stage within a run.
@@ -353,14 +377,14 @@ type Attempt struct {
 	FinishedAt *time.Time
 }
 
-const runCols = `id, pipeline, trigger, spec_yaml, spec_hash, source_dir, state, halt_stage, halt_reason, cancel_requested, created_at, finished_at`
+const runCols = `id, pipeline, trigger, spec_yaml, spec_hash, source_dir, state, halt_stage, halt_reason, cancel_requested, created_at, finished_at, COALESCE(event_id, 0), files_deleted_at`
 
 func scanRun(row interface{ Scan(...any) error }) (Run, error) {
 	var r Run
 	var created string
-	var finished sql.NullString
+	var finished, deleted sql.NullString
 	if err := row.Scan(&r.ID, &r.Pipeline, &r.Trigger, &r.SpecYAML, &r.SpecHash, &r.SourceDir, &r.State,
-		&r.HaltStage, &r.HaltReason, &r.CancelRequested, &created, &finished); err != nil {
+		&r.HaltStage, &r.HaltReason, &r.CancelRequested, &created, &finished, &r.EventID, &deleted); err != nil {
 		return Run{}, err
 	}
 	var err error
@@ -368,6 +392,9 @@ func scanRun(row interface{ Scan(...any) error }) (Run, error) {
 		return Run{}, err
 	}
 	if r.FinishedAt, err = parseTimePtr(finished); err != nil {
+		return Run{}, err
+	}
+	if r.FilesDeletedAt, err = parseTimePtr(deleted); err != nil {
 		return Run{}, err
 	}
 	return r, nil
@@ -490,7 +517,8 @@ func (s *Store) ResumeRun(ctx context.Context, id int64, reset []string) error {
 	}
 	defer tx.Rollback()
 	var pipeline, state string
-	if err := tx.QueryRowContext(ctx, `SELECT pipeline, state FROM runs WHERE id=?`, id).Scan(&pipeline, &state); err != nil {
+	var deleted sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT pipeline, state, files_deleted_at FROM runs WHERE id=?`, id).Scan(&pipeline, &state, &deleted); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("run %d %w", id, ErrNotFound)
 		}
@@ -500,6 +528,9 @@ func (s *Store) ResumeRun(ctx context.Context, id int64, reset []string) error {
 	case RunBlocked, RunFailed, RunCancelled:
 	default:
 		return fmt.Errorf("run %d is %s; only a blocked, failed or cancelled run can be resumed", id, state)
+	}
+	if deleted.Valid {
+		return fmt.Errorf("run %d cannot be resumed: its files and payload were deleted at %s", id, deleted.String)
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE runs SET state=?, halt_stage='', halt_reason='', cancel_requested=0, finished_at=NULL WHERE id=?`, RunRunning, id)
 	if err != nil {

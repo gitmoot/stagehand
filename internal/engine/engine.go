@@ -58,8 +58,11 @@ type Engine struct {
 	// stopping is set once Loop is shutting down; advance then only folds
 	// results and never starts a stage.
 	stopping atomic.Bool
-	wake     chan struct{}
-	wg       sync.WaitGroup
+	// beforeEventCommit, if set (tests only), runs after an intake has
+	// placed its payload file and before its event commits.
+	beforeEventCommit func(payloadPath string)
+	wake              chan struct{}
+	wg                sync.WaitGroup
 }
 
 type flightKey struct {
@@ -146,7 +149,9 @@ func (e *Engine) AddPipeline(ctx context.Context, raw []byte, sourceDir string, 
 	return p, e.Store.UpdatePipeline(ctx, p)
 }
 
-// SetEnabled turns a pipeline's schedule on or off. Enabling a schedule
+// SetEnabled turns a pipeline's schedule and event intake on or off; a
+// disabled pipeline refuses new events and leaves queued ones waiting until
+// it is enabled again. Enabling a schedule
 // without `at` makes it due at once; with `at` it is due at the next slot.
 func (e *Engine) SetEnabled(ctx context.Context, name string, enabled bool) (store.Pipeline, error) {
 	p, err := e.Store.GetPipeline(ctx, name)
@@ -349,7 +354,16 @@ type LoopOptions struct {
 	Schedule bool
 	// Only, when non-nil, limits execution to these runs.
 	Only map[int64]bool
-	// UntilIdle returns once no selected run is running.
+	// Events starts runs for queued events (implied by Schedule).
+	Events bool
+	// Pipeline, when set, limits event starts and advancing to this one
+	// pipeline.
+	Pipeline string
+	// Done, when set, ends the loop as soon as it reports true after an
+	// advance pass with nothing of the selected work in flight.
+	Done func(context.Context) bool
+	// UntilIdle returns once no selected run is running (and, with Events,
+	// no enabled pipeline has a queued event left).
 	UntilIdle bool
 }
 
@@ -364,20 +378,46 @@ func (e *Engine) Loop(ctx context.Context, opts LoopOptions) error {
 	}
 	lastSweep := time.Now()
 	for {
+		// A caller's goal already met (e.g. its run settled while another
+		// process held the lock) ends the loop before it dispatches work.
+		if opts.Done != nil && opts.Done(ctx) && e.inflightCount() == 0 {
+			return nil
+		}
 		if opts.Schedule {
 			if err := e.schedule(ctx); err != nil && ctx.Err() == nil {
 				e.Log.Error("schedule", "err", err)
 			}
 		}
-		busy, err := e.advanceAll(ctx, opts.Only)
+		if opts.Schedule || opts.Events {
+			if err := e.startEvents(ctx, opts.Pipeline, opts.Schedule); err != nil && ctx.Err() == nil {
+				e.Log.Error("start events", "err", err)
+			}
+		}
+		busy, err := e.advanceAll(ctx, opts.Only, opts.Pipeline)
 		if err != nil && ctx.Err() == nil {
 			e.Log.Error("advance", "err", err)
+		}
+		if !busy && (opts.Schedule || opts.Events) && opts.UntilIdle {
+			// A run that just settled may leave events waiting behind it.
+			if waiting, qerr := e.eventsWaiting(ctx, opts.Pipeline); qerr == nil && waiting {
+				busy = true
+			}
+			// A schedule that yielded to an older event is still due.
+			if due, serr := e.scheduleDue(ctx); opts.Schedule && serr == nil && due {
+				busy = true
+			}
 		}
 		if time.Since(lastSweep) >= CleanupInterval || (opts.UntilIdle && !busy) {
 			if serr := e.SweepCleanups(ctx); serr != nil && ctx.Err() == nil {
 				e.Log.Error("cleanup sweep", "err", serr)
 			}
+			if rerr := e.applyRetention(ctx); rerr != nil && ctx.Err() == nil {
+				e.Log.Error("retention", "err", rerr)
+			}
 			lastSweep = time.Now()
+		}
+		if opts.Done != nil && err == nil && opts.Done(ctx) && e.inflightCount() == 0 {
+			return nil
 		}
 		if opts.UntilIdle && !busy && err == nil {
 			return nil
@@ -405,7 +445,7 @@ func (e *Engine) stopAll(only map[int64]bool) {
 	e.wg.Wait()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if _, err := e.advanceAll(ctx, only); err != nil {
+	if _, err := e.advanceAll(ctx, only, ""); err != nil {
 		e.Log.Error("final advance", "err", err)
 	}
 }
@@ -447,14 +487,14 @@ func (e *Engine) inflightCount() int {
 
 // advanceAll advances every selected running run. busy reports whether any
 // selected run is still running afterwards.
-func (e *Engine) advanceAll(ctx context.Context, only map[int64]bool) (busy bool, err error) {
+func (e *Engine) advanceAll(ctx context.Context, only map[int64]bool, pipeline string) (busy bool, err error) {
 	runs, err := e.Store.ActiveRuns(ctx)
 	if err != nil {
 		return e.inflightCount() > 0, err
 	}
 	var errs []error
 	for _, r := range runs {
-		if only != nil && !only[r.ID] {
+		if (only != nil && !only[r.ID]) || (pipeline != "" && r.Pipeline != pipeline) {
 			continue
 		}
 		running, err := e.advance(ctx, r)
