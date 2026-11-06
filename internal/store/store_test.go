@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // A home created by an earlier binary must gain every later table when a
@@ -36,5 +37,31 @@ func TestOpenUpgradesAnExistingVersion1Home(t *testing.T) {
 	defer s.Close()
 	if _, err := s.PendingCleanups(context.Background()); err != nil {
 		t.Fatalf("pending cleanups on an upgraded home: %v", err)
+	}
+}
+
+// Two intakes of the same event can both pass the engine's early duplicate
+// check (slow request bodies overlap). The insert itself must then answer
+// "duplicate" for the second, without placing its payload.
+func TestInsertEventIsIdempotentInsideTheTransaction(t *testing.T) {
+	s, err := Open(context.Background(), filepath.Join(t.TempDir(), "stagehand.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ev := Event{Pipeline: "p", Key: "k", Source: "http", ReceivedAt: time.Now(), PayloadPath: "/a"}
+	placed := 0
+	place := func() error { placed++; return nil }
+	first, dup, err := s.InsertEvent(context.Background(), ev, 5, place)
+	if err != nil || dup {
+		t.Fatalf("first: dup=%v err=%v", dup, err)
+	}
+	ev.PayloadPath = "/b"
+	second, dup, err := s.InsertEvent(context.Background(), ev, 5, place)
+	if err != nil || !dup || second.ID != first.ID || second.PayloadPath != "/a" {
+		t.Fatalf("second: %+v dup=%v err=%v; want the first event as a duplicate", second, dup, err)
+	}
+	if placed != 1 {
+		t.Errorf("payload placed %d times", placed)
 	}
 }
