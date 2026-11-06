@@ -9,7 +9,8 @@ Wants=network-online.target stagehand-hetzner2-tunnel.service stagehand-gateway-
 Type=simple
 Environment=STAGEHAND_HOME=/var/lib/stagehand
 Environment=STAGEHAND_CONFIG=/etc/stagehand/config.yaml
-ExecStart=/usr/local/bin/stagehand serve --status-addr 127.0.0.1:8797
+# --trigger-addr: event intake (loopback only; needs events.secret_file in the config).
+ExecStart=/usr/local/bin/stagehand serve --status-addr 127.0.0.1:8797 --trigger-addr 127.0.0.1:8798
 Restart=on-failure
 RestartSec=10
 # Stop sends SIGTERM: running stages are stopped and their runs parked as
