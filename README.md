@@ -326,6 +326,10 @@ Payloads can be confidential (for example, mail with attachments).
   exit codes, cost and summaries.
 - **Purging a parked run:** `stagehand purge <run-id>` deletes a parked event run's files and payload
   once it will not be resumed; after that it cannot be resumed.
+- **Crash safety:** a deletion is recorded in the database before any file is removed, so it can
+  never race a resume. A deletion interrupted by a crash is finished by the next clean-up sweep,
+  at start-up and every minute. Payload files no event refers to are removed by the same sweep,
+  but only once they are 15 minutes old, so an intake still committing is never touched.
 
 ### Host settings
 
