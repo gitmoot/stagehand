@@ -146,7 +146,9 @@ func (e *Engine) AddPipeline(ctx context.Context, raw []byte, sourceDir string, 
 	return p, e.Store.UpdatePipeline(ctx, p)
 }
 
-// SetEnabled turns a pipeline's schedule on or off. Enabling a schedule
+// SetEnabled turns a pipeline's schedule and event intake on or off; a
+// disabled pipeline refuses new events and leaves queued ones waiting until
+// it is enabled again. Enabling a schedule
 // without `at` makes it due at once; with `at` it is due at the next slot.
 func (e *Engine) SetEnabled(ctx context.Context, name string, enabled bool) (store.Pipeline, error) {
 	p, err := e.Store.GetPipeline(ctx, name)
@@ -349,7 +351,10 @@ type LoopOptions struct {
 	Schedule bool
 	// Only, when non-nil, limits execution to these runs.
 	Only map[int64]bool
-	// UntilIdle returns once no selected run is running.
+	// Events starts runs for queued events (implied by Schedule).
+	Events bool
+	// UntilIdle returns once no selected run is running (and, with Events,
+	// no enabled pipeline has a queued event left).
 	UntilIdle bool
 }
 
@@ -369,13 +374,27 @@ func (e *Engine) Loop(ctx context.Context, opts LoopOptions) error {
 				e.Log.Error("schedule", "err", err)
 			}
 		}
+		if opts.Schedule || opts.Events {
+			if err := e.startEvents(ctx); err != nil && ctx.Err() == nil {
+				e.Log.Error("start events", "err", err)
+			}
+		}
 		busy, err := e.advanceAll(ctx, opts.Only)
 		if err != nil && ctx.Err() == nil {
 			e.Log.Error("advance", "err", err)
 		}
+		if !busy && (opts.Schedule || opts.Events) && opts.UntilIdle {
+			// A run that just settled may leave events waiting behind it.
+			if waiting, qerr := e.eventsWaiting(ctx); qerr == nil && waiting {
+				busy = true
+			}
+		}
 		if time.Since(lastSweep) >= CleanupInterval || (opts.UntilIdle && !busy) {
 			if serr := e.SweepCleanups(ctx); serr != nil && ctx.Err() == nil {
 				e.Log.Error("cleanup sweep", "err", serr)
+			}
+			if rerr := e.applyRetention(ctx); rerr != nil && ctx.Err() == nil {
+				e.Log.Error("retention", "err", rerr)
 			}
 			lastSweep = time.Now()
 		}

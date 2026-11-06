@@ -26,7 +26,28 @@ const (
 
 // Config is the settings file.
 type Config struct {
-	Agent Agent `yaml:"agent"`
+	Agent  Agent  `yaml:"agent"`
+	Events Events `yaml:"events"`
+}
+
+// DefaultMaxPayloadBytes is the default event payload limit (owner, 6 Nov).
+const DefaultMaxPayloadBytes = 64 << 20
+
+// Events configures event triggers on this host.
+type Events struct {
+	// SecretFile holds the HMAC key for the HTTP trigger (0600). Without it
+	// the HTTP trigger refuses to start; the local CLI trigger needs none.
+	SecretFile string `yaml:"secret_file"`
+	// MaxPayloadBytes bounds one event's payload (default 64 MiB).
+	MaxPayloadBytes int64 `yaml:"max_payload_bytes"`
+}
+
+// PayloadLimit is the configured limit or the default.
+func (e Events) PayloadLimit() int64 {
+	if e.MaxPayloadBytes > 0 {
+		return e.MaxPayloadBytes
+	}
+	return DefaultMaxPayloadBytes
 }
 
 // Agent configures agent stages.
@@ -91,6 +112,12 @@ func Load(path string, required bool) (Config, error) {
 
 // Validate checks the settings.
 func (c Config) Validate() error {
+	if c.Events.SecretFile != "" && !filepath.IsAbs(c.Events.SecretFile) {
+		return errors.New("config: events.secret_file must be an absolute path")
+	}
+	if c.Events.MaxPayloadBytes < 0 {
+		return errors.New("config: events.max_payload_bytes must not be negative")
+	}
 	a := c.Agent
 	switch a.Executor {
 	case ExecutorNone:

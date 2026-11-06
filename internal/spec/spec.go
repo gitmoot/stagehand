@@ -66,6 +66,7 @@ type Spec struct {
 	Name        string            `yaml:"name"`
 	Description string            `yaml:"description,omitempty"`
 	Schedule    *Schedule         `yaml:"schedule,omitempty"`
+	Events      *Events           `yaml:"events,omitempty"`
 	EnvFile     string            `yaml:"env_file,omitempty"`
 	Env         map[string]string `yaml:"env,omitempty"`
 	Stages      []Stage           `yaml:"stages"`
@@ -80,6 +81,18 @@ type Schedule struct {
 	Jitter   string `yaml:"jitter,omitempty" json:"jitter,omitempty"`
 	At       string `yaml:"at,omitempty" json:"at,omitempty"`
 }
+
+// Events opts a pipeline in to being started by external events (HTTP
+// trigger or `stagehand trigger`). Each accepted event queues one run; runs
+// start one at a time in arrival order.
+type Events struct {
+	// MaxQueued bounds how many events may wait. Beyond it a trigger is
+	// refused (nothing stored), so a burst cannot pile up unbounded work.
+	MaxQueued int `yaml:"max_queued" json:"max_queued"`
+}
+
+// MaxEventQueue is the largest allowed events.max_queued.
+const MaxEventQueue = 10000
 
 // Stage is one node of the DAG. Exactly one of Cmd (shell) or Agent is set.
 type Stage struct {
@@ -181,6 +194,9 @@ func (s Spec) Validate() error {
 		if err := s.Schedule.validate(); err != nil {
 			add("schedule: %v", err)
 		}
+	}
+	if s.Events != nil && (s.Events.MaxQueued < 1 || s.Events.MaxQueued > MaxEventQueue) {
+		add("events.max_queued %d must be between 1 and %d", s.Events.MaxQueued, MaxEventQueue)
 	}
 	if len(s.Stages) == 0 {
 		add("stages: at least one stage is required")

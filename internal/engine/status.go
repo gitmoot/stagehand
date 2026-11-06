@@ -25,9 +25,12 @@ type PipelineStatus struct {
 	Schedule    *spec.Schedule `json:"schedule,omitempty"`
 	NextDueAt   *time.Time     `json:"next_due_at"`
 	ActiveRunID *int64         `json:"active_run_id"`
-	LastRun     *RunSummary    `json:"last_run"`
-	SpecHash    string         `json:"spec_hash"`
-	Error       string         `json:"error,omitempty"`
+	// Events is set when the pipeline accepts events.
+	Events       *spec.Events `json:"events,omitempty"`
+	QueuedEvents int          `json:"queued_events"`
+	LastRun      *RunSummary  `json:"last_run"`
+	SpecHash     string       `json:"spec_hash"`
+	Error        string       `json:"error,omitempty"`
 }
 
 // RunSummary is a run without its stage detail.
@@ -43,6 +46,34 @@ type RunSummary struct {
 	Cost         float64    `json:"cost"`
 	InputTokens  int64      `json:"input_tokens"`
 	OutputTokens int64      `json:"output_tokens"`
+	// Event is set for event-triggered runs.
+	Event *EventRef `json:"event,omitempty"`
+	// FilesDeletedAt: the run's files and payload were deleted (retention).
+	FilesDeletedAt *time.Time `json:"files_deleted_at,omitempty"`
+}
+
+// EventRef identifies the event behind a run. The payload itself is never
+// included, only a reference to it.
+type EventRef struct {
+	ID            int64      `json:"id"`
+	Key           string     `json:"key"`
+	Source        string     `json:"source"`
+	ReceivedAt    time.Time  `json:"received_at"`
+	ContentType   string     `json:"content_type,omitempty"`
+	PayloadBytes  int64      `json:"payload_bytes"`
+	PayloadSHA256 string     `json:"payload_sha256"`
+	PayloadPath   string     `json:"payload_path,omitempty"`
+	DeletedAt     *time.Time `json:"payload_deleted_at,omitempty"`
+}
+
+// EventRefOf describes an event without its payload.
+func EventRefOf(ev store.Event) *EventRef {
+	ref := &EventRef{ID: ev.ID, Key: ev.Key, Source: ev.Source, ReceivedAt: ev.ReceivedAt, ContentType: ev.ContentType,
+		PayloadBytes: ev.PayloadBytes, PayloadSHA256: ev.PayloadSHA256, DeletedAt: ev.PayloadDeletedAt}
+	if ev.PayloadDeletedAt == nil {
+		ref.PayloadPath = ev.PayloadPath
+	}
+	return ref
 }
 
 // RunDetail is a run with its stages and attempts.
@@ -93,7 +124,7 @@ func (e *Engine) Status(ctx context.Context, version string) (Status, error) {
 		if sp, err := spec.Load(p.SpecYAML); err != nil {
 			ps.Error = err.Error()
 		} else {
-			ps.Description, ps.Schedule = sp.Description, sp.Schedule
+			ps.Description, ps.Schedule, ps.Events = sp.Description, sp.Schedule, sp.Events
 		}
 		last, err := e.Store.LastRun(ctx, p.Name)
 		if err != nil {
@@ -105,6 +136,9 @@ func (e *Engine) Status(ctx context.Context, version string) (Status, error) {
 				return Status{}, err
 			}
 			ps.LastRun = &sum
+		}
+		if ps.QueuedEvents, err = e.Store.QueuedEventCount(ctx, p.Name); err != nil {
+			return Status{}, err
 		}
 		active, err := e.Store.ActiveRunID(ctx, p.Name)
 		if err != nil {
@@ -140,11 +174,19 @@ func (e *Engine) summarize(ctx context.Context, r store.Run) (RunSummary, error)
 	if err != nil {
 		return RunSummary{}, err
 	}
-	return RunSummary{
+	sum := RunSummary{
 		ID: r.ID, Pipeline: r.Pipeline, Trigger: r.Trigger, State: r.State, CreatedAt: r.CreatedAt,
 		FinishedAt: r.FinishedAt, HaltStage: r.HaltStage, HaltReason: r.HaltReason,
-		Cost: cost, InputTokens: in, OutputTokens: out,
-	}, nil
+		Cost: cost, InputTokens: in, OutputTokens: out, FilesDeletedAt: r.FilesDeletedAt,
+	}
+	if r.EventID != 0 {
+		ev, err := e.Store.GetEvent(ctx, r.EventID)
+		if err != nil {
+			return RunSummary{}, err
+		}
+		sum.Event = EventRefOf(ev)
+	}
+	return sum, nil
 }
 
 // Run returns one run with its stages and attempts.

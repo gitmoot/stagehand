@@ -50,9 +50,17 @@ Runs:
   resume <run-id> [--from STAGE] [--wait]  re-run a parked run from a stage
   cancel <run-id>                          stop a running run
 
+Events:
+  trigger <name> [--event-id ID] [--payload-file F] [--content-type T] [--wait] [--json]
+                                           queue an event run (payload from the file, else stdin)
+  events [--pipeline N] [--state S] [--json]  accepted events, newest first
+  drop-event <event-id>                    discard a queued event and its payload
+  purge <run-id>                           delete a finished event run's files and payload
+
 Service:
-  serve [--status-addr 127.0.0.1:PORT] [--poll 5s]  run schedules and stages until stopped
-  tick                                     one pass: fire due schedules, run them to the end
+  serve [--status-addr ADDR] [--trigger-addr ADDR] [--poll 5s]
+                                           run schedules, events and stages until stopped
+  tick                                     one pass: fire due schedules and queued events, run them to the end
   gateway-proxy [--listen ADDR] [--upstream URL] [--token-file FILE]
                                            model credential proxy for sandboxed agent stages
   tunnel-clear-stale --ssh-host HOST --remote-listen ADDR:PORT
@@ -126,6 +134,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		"add": a.add, "list": a.list, "show": a.show, "enable": a.enable, "disable": a.disable,
 		"remove": a.remove, "run": a.run, "runs": a.runs, "resume": a.resume, "cancel": a.cancel,
 		"serve": a.serve, "tick": a.tick, "status": a.status,
+		"trigger": a.trigger, "events": a.events, "drop-event": a.dropEvent, "purge": a.purge,
 	}
 	fn, ok := commands[cmd]
 	if !ok {
@@ -152,6 +161,7 @@ type exitCode int
 func (e exitCode) Error() string { return fmt.Sprintf("exit %d", int(e)) }
 
 type app struct {
+	cfg    config.Config
 	home   string
 	store  *store.Store
 	engine *engine.Engine
@@ -232,7 +242,7 @@ func open(ctx context.Context, home, configPath string, stderr io.Writer) (*app,
 		}}
 	}
 	eng := engine.New(st, home, executors, baseEnv(), log)
-	return &app{home: home, store: st, engine: eng, stderr: stderr, log: log}, nil
+	return &app{cfg: cfg, home: home, store: st, engine: eng, stderr: stderr, log: log}, nil
 }
 
 func (a *app) close() { _ = a.store.Close() }
@@ -674,8 +684,10 @@ func (a *app) execute(ctx context.Context, id int64, wait bool) (bool, error) {
 func (a *app) serve(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	statusAddr := fs.String("status-addr", "", "loopback address for GET /status (off when empty)")
+	triggerAddr := fs.String("trigger-addr", "", "address for POST /v1/pipelines/{name}/events (off when empty)")
+	allowRemote := fs.Bool("trigger-allow-remote", false, "allow a non-loopback --trigger-addr")
 	poll := fs.Duration("poll", engine.DefaultPoll, "")
-	if _, err := parse(fs, args, 0, "serve [--status-addr 127.0.0.1:PORT] [--poll 5s]"); err != nil {
+	if _, err := parse(fs, args, 0, "serve [--status-addr 127.0.0.1:PORT] [--trigger-addr 127.0.0.1:PORT [--trigger-allow-remote]] [--poll 5s]"); err != nil {
 		return err
 	}
 	lock, err := homelock.TryAcquire(filepath.Join(a.home, "stagehand.lock"), homelock.ModeServe)
@@ -688,6 +700,13 @@ func (a *app) serve(ctx context.Context, args []string) error {
 	}
 	if *statusAddr != "" {
 		srv, err := a.statusServer(*statusAddr)
+		if err != nil {
+			return err
+		}
+		defer srv.Close()
+	}
+	if *triggerAddr != "" {
+		srv, err := a.triggerServer(*triggerAddr, *allowRemote)
 		if err != nil {
 			return err
 		}
@@ -719,7 +738,7 @@ func (a *app) tick(ctx context.Context, args []string) error {
 	if err := a.engine.Recover(ctx); err != nil {
 		return err
 	}
-	return a.engine.Loop(ctx, engine.LoopOptions{Schedule: true, UntilIdle: true})
+	return a.engine.Loop(ctx, engine.LoopOptions{Schedule: true, Events: true, UntilIdle: true})
 }
 
 // statusServer serves GET /status on a loopback address only.
