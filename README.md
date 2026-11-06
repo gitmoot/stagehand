@@ -216,6 +216,26 @@ Unit files and an example config are in [`deploy/`](deploy/).
 - **Stopping:** on `SIGTERM`, stagehand stops the running stages and starts nothing new. A run
   whose next stage was ready stays `running`, and the next runner continues it.
 
+## Moving from `gitmoot pipeline`
+
+Shell-stage specs carry over almost unchanged. The differences below are the ones that bite;
+the first one fails **silently**.
+
+| `gitmoot pipeline` | stagehand |
+|---|---|
+| The stage prints `{"gitmoot_result": {"decision": …}}` on stdout, and that decision decides the outcome | **stdout is only logged.** The exit code decides; to report `blocked` or `failed` while exiting 0, write `{"decision": "…", "summary": "…"}` to the file `$STAGEHAND_RESULT`. Unchanged scripts that print `blocked`/`failed` and exit 0 are recorded as **succeeded**, and the next stages run. |
+| Decisions `approved`, `skipped`, `blocked`, `failed` | `succeeded` (or no file), `blocked`, `failed`. Any other value fails the stage. Use `succeeded` with a summary for "skipped". |
+| `kind: shell` | Omit it: a stage with `cmd` is a shell stage. Unknown keys are rejected at `add`. |
+| `interval: 1h`, `jitter: 10m` | `schedule: {interval: 1h, jitter: 10m}` |
+| `repo`, `group` | Not used; put them in `description`. |
+| The stage inherits the runner's environment | Exact environment: only `PATH`, `HOME`, `LANG`, `TZ` and `STAGEHAND_*`. Anything else (e.g. `GITMOOT_ORG_ROLE`, `HERDR_*`) must be listed in the stage's `env_keys`, with its value in `env:` (non-secret) or `env_file:` (secrets, mode 0600). The runner's own environment is never passed through. |
+| `GITMOOT_PIPELINE_RUN_ID`, `GITMOOT_PIPELINE_STAGE_ID` | `STAGEHAND_RUN_ID`, `STAGEHAND_STAGE` |
+| A timer runs `gitmoot pipeline run <name>` | Use a stagehand `schedule:`, or keep the timer and run `stagehand run <name> --wait`. It exits non-zero unless the run succeeds. |
+| One pipeline per item, created with `pipeline add` then run | `stagehand add <spec> --replace --enable`, then `stagehand run <name> --wait --json`. |
+
+Check a converted spec once in a scratch home (`stagehand --home /tmp/x add spec.yaml --enable &&
+stagehand --home /tmp/x run <name> --wait`), including the path that reports `blocked`.
+
 ## Starting pipelines from events
 
 A pipeline can also be started by something that happens outside stagehand, for example a mail
