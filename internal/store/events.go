@@ -227,38 +227,73 @@ func (s *Store) DropEvent(ctx context.Context, id int64, at time.Time) (Event, e
 	if e.State != EventQueued {
 		return Event{}, fmt.Errorf("event %d is %s; only a queued event can be dropped (use `purge <run-id>` for a started one)", id, e.State)
 	}
-	if err := removePayload(e.PayloadPath); err != nil {
+	// Record the drop first: once committed the event can never start, so a
+	// crash before the unlink below leaves only an orphan file, which the
+	// sweep removes. Unlinking first could leave a runnable event with no
+	// input.
+	now := fmtTime(at)
+	if _, err := tx.ExecContext(ctx, `UPDATE events SET state=?, payload_deleted_at=? WHERE id=?`, EventDropped, now, id); err != nil {
 		return Event{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE events SET state=?, payload_deleted_at=? WHERE id=?`, EventDropped, fmtTime(at), id); err != nil {
+	if err := tx.Commit(); err != nil {
 		return Event{}, err
 	}
 	e.State = EventDropped
-	return e, tx.Commit()
+	e.PayloadDeletedAt = &at
+	if err := removePayload(e.PayloadPath); err != nil {
+		return e, fmt.Errorf("event %d dropped, but its payload file is still there (the sweep will remove it): %w", id, err)
+	}
+	return e, nil
 }
 
-// RetentionDue lists succeeded event runs whose files are not deleted yet.
+// RetentionDue lists succeeded event runs whose files are not claimed for
+// deletion yet.
 func (s *Store) RetentionDue(ctx context.Context) ([]Run, error) {
 	return s.queryRuns(ctx, `WHERE event_id IS NOT NULL AND state=? AND files_deleted_at IS NULL ORDER BY id`, RunSucceeded)
 }
 
-// MarkFilesDeleted records that a run's directory and its event's payload
-// are gone.
-func (s *Store) MarkFilesDeleted(ctx context.Context, runID, eventID int64, at time.Time) error {
+// DeletedRuns lists runs whose files were claimed for deletion, so an
+// interrupted deletion can be finished.
+func (s *Store) DeletedRuns(ctx context.Context) ([]Run, error) {
+	return s.queryRuns(ctx, `WHERE files_deleted_at IS NOT NULL ORDER BY id`)
+}
+
+// ErrNotDeletable is returned when a run cannot have its files deleted now
+// (it is running, or it is not a finished event run).
+var ErrNotDeletable = errors.New("run files cannot be deleted now")
+
+// ClaimFilesDeletion irreversibly marks a finished run's files and its
+// event's payload as deleted, BEFORE anything is removed from disk. It only
+// succeeds on a run that is not running and not already claimed, in one
+// transaction, so it is serialized against ResumeRun (which refuses a
+// claimed run). The caller then deletes the files; an interrupted deletion
+// is finished from DeletedRuns.
+func (s *Store) ClaimFilesDeletion(ctx context.Context, runID int64, at time.Time) (Run, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return Run{}, err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE runs SET files_deleted_at=? WHERE id=?`, fmtTime(at), runID); err != nil {
-		return err
+	res, err := tx.ExecContext(ctx, `UPDATE runs SET files_deleted_at=? WHERE id=? AND state!=? AND files_deleted_at IS NULL`,
+		fmtTime(at), runID, RunRunning)
+	if err != nil {
+		return Run{}, err
 	}
-	if eventID != 0 {
-		if _, err := tx.ExecContext(ctx, `UPDATE events SET payload_deleted_at=COALESCE(payload_deleted_at, ?) WHERE id=?`, fmtTime(at), eventID); err != nil {
-			return err
+	if n, err := res.RowsAffected(); err != nil {
+		return Run{}, err
+	} else if n == 0 {
+		return Run{}, fmt.Errorf("run %d: %w (running, already deleted, or missing)", runID, ErrNotDeletable)
+	}
+	r, err := scanRun(tx.QueryRowContext(ctx, `SELECT `+runCols+` FROM runs WHERE id=?`, runID))
+	if err != nil {
+		return Run{}, err
+	}
+	if r.EventID != 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE events SET payload_deleted_at=COALESCE(payload_deleted_at, ?) WHERE id=?`, fmtTime(at), r.EventID); err != nil {
+			return Run{}, err
 		}
 	}
-	return tx.Commit()
+	return r, tx.Commit()
 }
 
 // LivePayloadPaths returns every payload path not yet deleted, for the

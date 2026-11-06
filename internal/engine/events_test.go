@@ -313,3 +313,128 @@ func TestPayloadDeletedAtTheMomentTheRunSucceeds(t *testing.T) {
 		t.Fatal("payload still on disk right after the run succeeded")
 	}
 }
+
+// An intake in another process may have placed its payload file and not yet
+// committed the event. A sweep at that moment must leave the file alone.
+func TestSweepSparesAPayloadWhoseIntakeHasNotCommitted(t *testing.T) {
+	h := newHarness(t, nil)
+	h.add(eventPipeline, true)
+	h.now = time.Now()
+	ctx := context.Background()
+	// The sweeping process (e.g. serve) has the store open already.
+	other, err := store.Open(ctx, filepath.Join(h.eng.Home, "stagehand.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	peer := New(other, h.eng.Home, nil, nil, nil)
+	peer.Now = func() time.Time { return h.now }
+	var swept bool
+	_, _, err = h.eng.Store.InsertEvent(ctx, store.Event{Pipeline: "ev", Key: "k", Source: SourceHTTP, ReceivedAt: h.now,
+		PayloadPath: filepath.Join(h.eng.payloadDir(), "placed.payload")}, 3, func() error {
+		os.MkdirAll(h.eng.payloadDir(), 0o700)
+		if err := os.WriteFile(filepath.Join(h.eng.payloadDir(), "placed.payload"), []byte("deck"), 0o600); err != nil {
+			return err
+		}
+		// The sweep runs in the other process while this intake's
+		// transaction is still open.
+		swept = true
+		return peer.sweepOrphanPayloads(ctx)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !swept {
+		t.Fatal("sweep did not run")
+	}
+	if _, err := os.Stat(filepath.Join(h.eng.payloadDir(), "placed.payload")); err != nil {
+		t.Fatal("sweep deleted the payload of an intake that was about to commit")
+	}
+}
+
+// Purge claims the deletion in the database before touching files, so a
+// concurrent resume is refused instead of resuming a run whose files vanish.
+func TestPurgeAndResumeAreMutuallyExclusive(t *testing.T) {
+	h := newHarness(t, map[string][]string{"a": {"fail"}})
+	h.add(eventPipeline, true)
+	res, _ := h.trigger("p", "secret")
+	h.drain()
+	ctx := context.Background()
+	ev, _ := h.eng.Store.GetEvent(ctx, res.Event.ID)
+	// A claim without the file removal, as if purge stopped right after it.
+	if _, err := h.eng.Store.ClaimFilesDeletion(ctx, ev.RunID, h.now); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.eng.Resume(ctx, ev.RunID, ""); err == nil {
+		t.Fatal("resume accepted a run already claimed for deletion")
+	}
+	// And the other order: once resumed (running), it cannot be claimed.
+	h2 := newHarness(t, map[string][]string{"a": {"fail", "hang"}})
+	h2.add(eventPipeline, true)
+	res2, _ := h2.trigger("q", "secret")
+	h2.drain()
+	ev2, _ := h2.eng.Store.GetEvent(ctx, res2.Event.ID)
+	if err := h2.eng.Resume(ctx, ev2.RunID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h2.eng.Store.ClaimFilesDeletion(ctx, ev2.RunID, h2.now); !errors.Is(err, store.ErrNotDeletable) {
+		t.Fatalf("claimed a running run: %v", err)
+	}
+	if err := h2.eng.Purge(ctx, ev2.RunID); err == nil {
+		t.Fatal("purged a running run")
+	}
+	if _, err := os.Stat(ev2.PayloadPath); err != nil {
+		t.Fatal("payload of the resumed run is gone")
+	}
+}
+
+// A deletion interrupted after its claim is finished by the next sweep.
+func TestInterruptedDeletionIsFinished(t *testing.T) {
+	h := newHarness(t, map[string][]string{"a": {"fail"}})
+	h.add(eventPipeline, true)
+	res, _ := h.trigger("p", "secret")
+	h.drain()
+	ctx := context.Background()
+	ev, _ := h.eng.Store.GetEvent(ctx, res.Event.ID)
+	if _, err := h.eng.Store.ClaimFilesDeletion(ctx, ev.RunID, h.now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(ev.PayloadPath); err != nil {
+		t.Fatal("setup: payload should still be on disk")
+	}
+	if err := h.eng.applyRetention(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(ev.PayloadPath); !os.IsNotExist(err) {
+		t.Error("claimed payload not removed by the sweep")
+	}
+	if _, err := os.Stat(h.eng.RunDir(ev.RunID)); !os.IsNotExist(err) {
+		t.Error("claimed run directory not removed by the sweep")
+	}
+}
+
+// Drop commits "dropped" before unlinking: if the unlink never happens the
+// event is still not runnable, and the sweep removes the file later.
+func TestDroppedEventNeverRunsEvenIfItsFileSurvives(t *testing.T) {
+	h := newHarness(t, nil)
+	h.add(eventPipeline, true)
+	h.eng.SetEnabled(context.Background(), "ev", false)
+	h.eng.SetEnabled(context.Background(), "ev", true)
+	res, _ := h.trigger("d", "secret")
+	ctx := context.Background()
+	// Make the unlink fail: replace the payload with a non-empty directory.
+	os.Remove(res.Event.PayloadPath)
+	os.MkdirAll(filepath.Join(res.Event.PayloadPath, "x"), 0o700)
+	_, err := h.eng.DropEvent(ctx, res.Event.ID)
+	if err == nil {
+		t.Fatal("setup: unlink should have failed")
+	}
+	ev, _ := h.eng.Store.GetEvent(ctx, res.Event.ID)
+	if ev.State != store.EventDropped || ev.PayloadDeletedAt == nil {
+		t.Fatalf("event %s after a failed unlink; it must already be dropped", ev.State)
+	}
+	h.drain()
+	if h.ex.callCount("a") != 0 {
+		t.Fatal("a dropped event ran")
+	}
+}

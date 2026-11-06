@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/gitmoot/stagehand/internal/spec"
@@ -189,13 +188,23 @@ func (e *Engine) startEvents(ctx context.Context) error {
 // event run (owner decision, 6 Nov: confidential payloads do not outlive a
 // successful run), and sweeps payload files no event refers to.
 func (e *Engine) applyRetention(ctx context.Context) error {
+	var errs []error
 	runs, err := e.Store.RetentionDue(ctx)
 	if err != nil {
 		return err
 	}
-	var errs []error
 	for _, r := range runs {
-		if err := e.deleteRunFiles(ctx, r); err != nil {
+		if err := e.deleteRunFiles(ctx, r.ID); err != nil && !errors.Is(err, store.ErrNotDeletable) {
+			errs = append(errs, err)
+		}
+	}
+	// Finish deletions interrupted between the claim and the unlinks.
+	claimed, err := e.Store.DeletedRuns(ctx)
+	if err != nil {
+		return err
+	}
+	for _, r := range claimed {
+		if err := e.removeRunFiles(ctx, r); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -205,7 +214,23 @@ func (e *Engine) applyRetention(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-func (e *Engine) deleteRunFiles(ctx context.Context, r store.Run) error {
+// deleteRunFiles claims a finished run's files for deletion (atomically
+// against resume), then removes them.
+func (e *Engine) deleteRunFiles(ctx context.Context, runID int64) error {
+	r, err := e.Store.ClaimFilesDeletion(ctx, runID, e.now())
+	if err != nil {
+		return err
+	}
+	if err := e.removeRunFiles(ctx, r); err != nil {
+		return err
+	}
+	e.Log.Info("deleted run files and payload", "run", r.ID, "event", r.EventID)
+	return nil
+}
+
+// removeRunFiles removes a claimed run's directory and payload. It is
+// idempotent, so an interrupted deletion can simply be repeated.
+func (e *Engine) removeRunFiles(ctx context.Context, r store.Run) error {
 	if err := os.RemoveAll(e.RunDir(r.ID)); err != nil {
 		return fmt.Errorf("run %d: delete files: %w", r.ID, err)
 	}
@@ -218,15 +243,14 @@ func (e *Engine) deleteRunFiles(ctx context.Context, r store.Run) error {
 			return fmt.Errorf("run %d: delete payload: %w", r.ID, err)
 		}
 	}
-	if err := e.Store.MarkFilesDeleted(ctx, r.ID, r.EventID, e.now()); err != nil {
-		return err
-	}
-	e.Log.Info("deleted run files and payload", "run", r.ID, "event", r.EventID)
 	return nil
 }
 
 // sweepOrphanPayloads removes payload files that no live event references:
-// leftovers of an intake interrupted between write and commit.
+// leftovers of an intake interrupted before its commit, or of a drop or
+// deletion interrupted after its commit. Files modified within orphanAge are
+// never touched: an intake in another process may have placed its payload
+// and not committed yet.
 func (e *Engine) sweepOrphanPayloads(ctx context.Context) error {
 	entries, err := os.ReadDir(e.payloadDir())
 	if errors.Is(err, os.ErrNotExist) {
@@ -235,19 +259,25 @@ func (e *Engine) sweepOrphanPayloads(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var old []string
+	for _, ent := range entries {
+		info, err := ent.Info()
+		if err != nil || e.now().Sub(info.ModTime()) < orphanAge {
+			continue
+		}
+		old = append(old, filepath.Join(e.payloadDir(), ent.Name()))
+	}
+	if len(old) == 0 {
+		return nil
+	}
+	// Read the live set AFTER choosing candidates: any intake that placed
+	// one of them committed long ago (or never will).
 	live, err := e.Store.LivePayloadPaths(ctx)
 	if err != nil {
 		return err
 	}
-	for _, ent := range entries {
-		path := filepath.Join(e.payloadDir(), ent.Name())
-		if strings.HasPrefix(ent.Name(), ".incoming-") {
-			// An intake in progress in another process owns it; only
-			// remove ones old enough to be abandoned.
-			if info, err := ent.Info(); err == nil && e.now().Sub(info.ModTime()) < orphanAge {
-				continue
-			}
-		} else if live[path] {
+	for _, path := range old {
+		if live[path] {
 			continue
 		}
 		if err := os.Remove(path); err == nil {
@@ -274,7 +304,7 @@ func (e *Engine) Purge(ctx context.Context, runID int64) error {
 	if r.FilesDeletedAt != nil {
 		return nil
 	}
-	return e.deleteRunFiles(ctx, r)
+	return e.deleteRunFiles(ctx, runID)
 }
 
 // DropEvent discards a queued event and its payload.
