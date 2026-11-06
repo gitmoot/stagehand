@@ -328,8 +328,9 @@ Payloads can be confidential (for example, mail with attachments).
   once it will not be resumed; after that it cannot be resumed.
 - **Crash safety:** a deletion is recorded in the database before any file is removed, so it can
   never race a resume. A deletion interrupted by a crash is finished by the next clean-up sweep,
-  at start-up and every minute. Payload files no event refers to are removed by the same sweep,
-  but only once they are 15 minutes old, so an intake still committing is never touched.
+  at start-up and every minute. Payload files no event refers to are removed by the same sweep.
+  An intake holds a lock on its file until its event is committed, and the sweep never removes a
+  file it cannot lock, so an intake in progress is never touched, however long its sender took.
 
 ### Host settings
 
