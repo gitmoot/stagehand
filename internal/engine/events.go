@@ -158,7 +158,7 @@ func (e *Engine) Trigger(ctx context.Context, req EventRequest) (EventResult, er
 
 // startEvents starts the oldest queued event of every enabled pipeline that
 // has no running run.
-func (e *Engine) startEvents(ctx context.Context, only string) error {
+func (e *Engine) startEvents(ctx context.Context, only string, yieldToSchedule bool) error {
 	pipelines, err := e.Store.ListPipelines(ctx)
 	if err != nil {
 		return err
@@ -182,7 +182,9 @@ func (e *Engine) startEvents(ctx context.Context, only string) error {
 		if err != nil {
 			continue
 		}
-		if sp.Schedule != nil && p.NextDueAt != nil && !e.now().Before(*p.NextDueAt) && !eventBeforeSchedule(ev, p) {
+		// Yield to an older due schedule only when this loop also runs
+		// schedules; otherwise nothing would ever dispatch it.
+		if yieldToSchedule && sp.Schedule != nil && p.NextDueAt != nil && !e.now().Before(*p.NextDueAt) && !eventBeforeSchedule(ev, p) {
 			continue // the due schedule is older; it goes first
 		}
 		ids := make([]string, len(sp.Stages))

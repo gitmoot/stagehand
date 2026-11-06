@@ -378,13 +378,18 @@ func (e *Engine) Loop(ctx context.Context, opts LoopOptions) error {
 	}
 	lastSweep := time.Now()
 	for {
+		// A caller's goal already met (e.g. its run settled while another
+		// process held the lock) ends the loop before it dispatches work.
+		if opts.Done != nil && opts.Done(ctx) && e.inflightCount() == 0 {
+			return nil
+		}
 		if opts.Schedule {
 			if err := e.schedule(ctx); err != nil && ctx.Err() == nil {
 				e.Log.Error("schedule", "err", err)
 			}
 		}
 		if opts.Schedule || opts.Events {
-			if err := e.startEvents(ctx, opts.Pipeline); err != nil && ctx.Err() == nil {
+			if err := e.startEvents(ctx, opts.Pipeline, opts.Schedule); err != nil && ctx.Err() == nil {
 				e.Log.Error("start events", "err", err)
 			}
 		}

@@ -96,6 +96,9 @@ func (a *app) drainEvent(ctx context.Context, pipeline string, id int64) (int64,
 		}
 		lock, err := homelock.TryAcquire(filepath.Join(a.home, "stagehand.lock"), homelock.ModeCLI)
 		if err == nil {
+			// Loop checks Done before dispatching anything, so if the run
+			// settled while another process held the lock, nothing newer is
+			// started here.
 			rerr := a.engine.Recover(ctx)
 			if rerr == nil {
 				rerr = a.engine.Loop(ctx, engine.LoopOptions{Events: true, Pipeline: pipeline, Done: settled, UntilIdle: true})

@@ -288,7 +288,7 @@ func TestPayloadDeletedAtTheMomentTheRunSucceeds(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	if err := h.eng.startEvents(ctx, ""); err != nil {
+	if err := h.eng.startEvents(ctx, "", true); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(10 * time.Second)
@@ -531,7 +531,7 @@ func TestDueScheduleDoesNotStarveQueuedEvents(t *testing.T) {
 		if err := h.eng.schedule(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if err := h.eng.startEvents(ctx, ""); err != nil {
+		if err := h.eng.startEvents(ctx, "", true); err != nil {
 			t.Fatal(err)
 		}
 		runs, _ := h.eng.Runs(ctx, "ev", 10)
@@ -579,5 +579,43 @@ func TestSweepOpensCandidatesWritable(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("a file the sweep cannot open writable was silently treated as in use")
+	}
+}
+
+// An events-only loop (trigger --wait without serve) cannot dispatch
+// schedules, so it must not yield an event to a due schedule.
+func TestEventsOnlyLoopDoesNotWaitForASchedule(t *testing.T) {
+	h := newHarness(t, nil)
+	// Enabled with a schedule: due at once (first_due = now).
+	h.add("name: ev\nschedule: {interval: 1h}\nevents: {max_queued: 3}\nstages:\n  - {id: a, cmd: x}\n", true)
+	h.now = h.now.Add(time.Minute) // the event is newer than the due time
+	res, err := h.trigger("e", "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.eng.Loop(ctx, LoopOptions{Events: true, UntilIdle: true}); err != nil {
+		t.Fatal(err)
+	}
+	ev, _ := h.eng.Store.GetEvent(context.Background(), res.Event.ID)
+	if ev.State != store.EventStarted {
+		t.Fatalf("event %s; an events-only loop stalled behind a schedule it cannot run", ev.State)
+	}
+}
+
+// A loop whose goal is already met dispatches nothing.
+func TestLoopWithDoneAlreadyTrueStartsNothing(t *testing.T) {
+	h := newHarness(t, nil)
+	h.add(eventPipeline, true)
+	if _, err := h.trigger("newer", "x"); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := h.eng.Loop(ctx, LoopOptions{Events: true, UntilIdle: true, Done: func(context.Context) bool { return true }}); err != nil {
+		t.Fatal(err)
+	}
+	if n := h.ex.callCount("a"); n != 0 {
+		t.Fatalf("started %d attempts although the caller's goal was already met", n)
 	}
 }
