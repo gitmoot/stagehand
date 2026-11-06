@@ -176,7 +176,18 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 	}
 	if allOK {
 		e.Log.Info("run succeeded", "run", run.ID)
-		return false, e.Store.FinishRun(ctx, run.ID, store.RunSucceeded, "", "", e.now())
+		if err := e.Store.FinishRun(ctx, run.ID, store.RunSucceeded, "", "", e.now()); err != nil {
+			return false, err
+		}
+		if run.EventID != 0 {
+			// Retention (owner, 6 Nov): a succeeded event run's payload and
+			// files go at once. A failure here is retried by the sweep.
+			run.State = store.RunSucceeded
+			if err := e.deleteRunFiles(ctx, run); err != nil {
+				e.Log.Error("retention; the sweep will retry", "run", run.ID, "err", err)
+			}
+		}
+		return false, nil
 	}
 	final := store.RunBlocked
 	var haltStage, haltReason string

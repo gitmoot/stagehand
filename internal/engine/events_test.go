@@ -180,9 +180,7 @@ func TestRetentionDeletesOnSuccessAndKeepsParkedRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.runToEnd(badRun.ID)
-	if err := h.eng.applyRetention(ctx); err != nil {
-		t.Fatal(err)
-	}
+	// Deleted at once when the run succeeds, not only by the periodic sweep.
 	if _, err := os.Stat(badEv.PayloadPath); !os.IsNotExist(err) {
 		t.Error("payload kept after the resumed run succeeded")
 	}
@@ -277,5 +275,41 @@ func TestConcurrentDuplicateTriggersStoreOneEvent(t *testing.T) {
 	}
 	if files, _ := os.ReadDir(h.eng.payloadDir()); len(files) != 1 {
 		t.Errorf("%d payload files for one event", len(files))
+	}
+}
+
+// The payload goes the moment its run succeeds, not at the next periodic
+// sweep (which runs only once a minute under serve).
+func TestPayloadDeletedAtTheMomentTheRunSucceeds(t *testing.T) {
+	h := newHarness(t, nil)
+	h.add(eventPipeline, true)
+	res, err := h.trigger("now", "confidential")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := h.eng.startEvents(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		busy, err := h.eng.advanceAll(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !busy {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("run did not settle")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	ev, _ := h.eng.Store.GetEvent(ctx, res.Event.ID)
+	if r, _ := h.eng.Store.GetRun(ctx, ev.RunID); r.State != store.RunSucceeded {
+		t.Fatalf("run %s", r.State)
+	}
+	if _, err := os.Stat(ev.PayloadPath); !os.IsNotExist(err) {
+		t.Fatal("payload still on disk right after the run succeeded")
 	}
 }
