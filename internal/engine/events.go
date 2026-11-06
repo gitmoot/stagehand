@@ -158,14 +158,14 @@ func (e *Engine) Trigger(ctx context.Context, req EventRequest) (EventResult, er
 
 // startEvents starts the oldest queued event of every enabled pipeline that
 // has no running run.
-func (e *Engine) startEvents(ctx context.Context) error {
+func (e *Engine) startEvents(ctx context.Context, only string) error {
 	pipelines, err := e.Store.ListPipelines(ctx)
 	if err != nil {
 		return err
 	}
 	var errs []error
 	for _, p := range pipelines {
-		if !p.Enabled {
+		if !p.Enabled || (only != "" && p.Name != only) {
 			continue
 		}
 		ev, err := e.Store.OldestQueuedEvent(ctx, p.Name)
@@ -181,6 +181,9 @@ func (e *Engine) startEvents(ctx context.Context) error {
 		sp, err := spec.Load(p.SpecYAML)
 		if err != nil {
 			continue
+		}
+		if sp.Schedule != nil && p.NextDueAt != nil && !e.now().Before(*p.NextDueAt) && !eventBeforeSchedule(ev, p) {
+			continue // the due schedule is older; it goes first
 		}
 		ids := make([]string, len(sp.Stages))
 		for i, st := range sp.Stages {
@@ -297,13 +300,21 @@ func (e *Engine) sweepOrphanPayloads(ctx context.Context) error {
 
 // sweepOne removes path if it is unlocked and no live event references it.
 func (e *Engine) sweepOne(ctx context.Context, path string) error {
-	f, err := os.Open(path)
-	if err != nil {
+	// Read-write: on NFS, Linux emulates flock with fcntl locks, and an
+	// exclusive one needs a writable descriptor.
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if errors.Is(err, os.ErrNotExist) {
 		return nil // gone already
+	}
+	if err != nil {
+		return fmt.Errorf("sweep %s: %w", path, err)
 	}
 	defer f.Close()
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return nil // an intake holds it
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil // an intake holds it
+		}
+		return fmt.Errorf("sweep %s: lock: %w", path, err)
 	}
 	// With the lock held, no intake can still be committing this file:
 	// whatever the live set says now is final for it.
@@ -335,7 +346,8 @@ func (e *Engine) Purge(ctx context.Context, runID int64) error {
 		return fmt.Errorf("run %d is running; cancel it first", runID)
 	}
 	if r.FilesDeletedAt != nil {
-		return nil
+		// Claimed earlier; removal may not have completed. It is idempotent.
+		return e.removeRunFiles(ctx, r)
 	}
 	return e.deleteRunFiles(ctx, runID)
 }
@@ -364,13 +376,13 @@ func randomHex(n int) string {
 }
 
 // eventsWaiting reports whether any enabled pipeline has a queued event.
-func (e *Engine) eventsWaiting(ctx context.Context) (bool, error) {
+func (e *Engine) eventsWaiting(ctx context.Context, only string) (bool, error) {
 	pipelines, err := e.Store.ListPipelines(ctx)
 	if err != nil {
 		return false, err
 	}
 	for _, p := range pipelines {
-		if !p.Enabled {
+		if !p.Enabled || (only != "" && p.Name != only) {
 			continue
 		}
 		n, err := e.Store.QueuedEventCount(ctx, p.Name)
@@ -379,6 +391,37 @@ func (e *Engine) eventsWaiting(ctx context.Context) (bool, error) {
 		}
 		if n > 0 {
 			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// eventBeforeSchedule reports whether a pipeline's oldest queued event
+// arrived before its schedule came due. Whichever is older takes the
+// pipeline's single run slot, so neither source can starve the other.
+func eventBeforeSchedule(ev *store.Event, p store.Pipeline) bool {
+	if ev == nil {
+		return false
+	}
+	if p.NextDueAt == nil {
+		return true
+	}
+	return !ev.ReceivedAt.After(*p.NextDueAt)
+}
+
+// scheduleDue reports whether an enabled, scheduled pipeline is due now.
+func (e *Engine) scheduleDue(ctx context.Context) (bool, error) {
+	pipelines, err := e.Store.ListPipelines(ctx)
+	if err != nil {
+		return false, err
+	}
+	now := e.now()
+	for _, p := range pipelines {
+		if p.Enabled && p.NextDueAt != nil && !now.Before(*p.NextDueAt) {
+			sp, err := spec.Load(p.SpecYAML)
+			if err == nil && sp.Schedule != nil {
+				return true, nil
+			}
 		}
 	}
 	return false, nil

@@ -454,6 +454,16 @@ func (e *Engine) schedule(ctx context.Context) error {
 		if active {
 			continue // fire as soon as the active run settles
 		}
+		if sp.Events != nil {
+			ev, err := e.Store.OldestQueuedEvent(ctx, p.Name)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			if eventBeforeSchedule(ev, p) {
+				continue // an older event goes first; the schedule stays due
+			}
+		}
 		if _, err := e.createRun(ctx, p, sp, "schedule"); err != nil && !errors.Is(err, store.ErrActiveRun) {
 			errs = append(errs, err)
 			continue

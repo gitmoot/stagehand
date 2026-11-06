@@ -70,3 +70,37 @@ func TestConcurrentStandaloneRunsBothExecute(t *testing.T) {
 		t.Fatalf("b runs %s", out)
 	}
 }
+
+// trigger --wait returns once its own event's run is done, even while other
+// pipelines keep running and newer events keep the queue non-empty.
+func TestTriggerWaitReturnsWhenItsOwnRunIsDone(t *testing.T) {
+	home := t.TempDir()
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "fast.yaml"), []byte("name: fast\nevents: {max_queued: 5}\nstages:\n  - {id: a, cmd: 'true'}\n"), 0o600)
+	os.WriteFile(filepath.Join(dir, "slow.yaml"), []byte("name: slow\nevents: {max_queued: 5}\nstages:\n  - {id: a, cmd: 'sleep 30'}\n"), 0o600)
+	for _, f := range []string{"fast.yaml", "slow.yaml"} {
+		if code, _, errs := runCLI(home, "add", filepath.Join(dir, f), "--enable"); code != 0 {
+			t.Fatal(errs)
+		}
+	}
+	empty := filepath.Join(dir, "empty")
+	os.WriteFile(empty, nil, 0o600)
+	// A long event in another pipeline is queued first.
+	if code, _, errs := runCLI(home, "trigger", "slow", "--payload-file", empty); code != 0 {
+		t.Fatal(errs)
+	}
+	done := make(chan int, 1)
+	start := time.Now()
+	go func() { code, _, _ := runCLI(home, "trigger", "fast", "--payload-file", empty, "--wait"); done <- code }()
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("exit %d", code)
+		}
+		if time.Since(start) > 15*time.Second {
+			t.Errorf("took %v; it waited for the other pipeline", time.Since(start))
+		}
+	case <-time.After(25 * time.Second):
+		t.Fatal("trigger --wait did not return after its own run finished")
+	}
+}

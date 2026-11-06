@@ -62,33 +62,43 @@ func (a *app) trigger(ctx context.Context, args []string) error {
 		fmt.Fprintf(a.stdout, "event %d: %s\n", ev.ID, ev.State)
 		return nil
 	}
-	runID, err := a.drainUntilStarted(ctx, ev.ID)
+	runID, err := a.drainEvent(ctx, ev.Pipeline, ev.ID)
 	if err != nil {
 		return err
 	}
 	return a.finish(ctx, runID, true, *asJSON)
 }
 
-// drainUntilStarted waits for event id to get a run, executing queued events
-// here when no other process executes stages.
-func (a *app) drainUntilStarted(ctx context.Context, id int64) (int64, error) {
+// drainEvent waits until event id has a run that has settled, and returns
+// the run. When no other process executes stages it does the work here,
+// limited to the event's own pipeline (whose events run one at a time, in
+// order), and stops as soon as that run settles: newer arrivals or other
+// pipelines never keep it waiting.
+func (a *app) drainEvent(ctx context.Context, pipeline string, id int64) (int64, error) {
+	settled := func(ctx context.Context) bool {
+		ev, err := a.store.GetEvent(ctx, id)
+		if err != nil || ev.State != store.EventStarted {
+			return ev.State == store.EventDropped
+		}
+		r, err := a.store.GetRun(ctx, ev.RunID)
+		return err == nil && r.State != store.RunRunning
+	}
 	for {
 		ev, err := a.store.GetEvent(ctx, id)
 		if err != nil {
 			return 0, err
 		}
-		switch ev.State {
-		case store.EventStarted:
-			return ev.RunID, nil
-		case store.EventDropped:
+		if ev.State == store.EventDropped {
 			return 0, fmt.Errorf("event %d was dropped", id)
+		}
+		if ev.State == store.EventStarted && settled(ctx) {
+			return ev.RunID, nil
 		}
 		lock, err := homelock.TryAcquire(filepath.Join(a.home, "stagehand.lock"), homelock.ModeCLI)
 		if err == nil {
 			rerr := a.engine.Recover(ctx)
 			if rerr == nil {
-				// Start (and run) queued events until this one has a run.
-				rerr = a.engine.Loop(ctx, engine.LoopOptions{Events: true, UntilIdle: true})
+				rerr = a.engine.Loop(ctx, engine.LoopOptions{Events: true, Pipeline: pipeline, Done: settled, UntilIdle: true})
 			}
 			lock.Release()
 			if rerr != nil {
@@ -96,7 +106,8 @@ func (a *app) drainUntilStarted(ctx context.Context, id int64) (int64, error) {
 			}
 			continue
 		}
-		if !errors.Is(err, homelock.ErrHeld) {
+		var held *homelock.HeldError
+		if !errors.As(err, &held) {
 			return 0, err
 		}
 		select {

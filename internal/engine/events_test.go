@@ -288,12 +288,12 @@ func TestPayloadDeletedAtTheMomentTheRunSucceeds(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	if err := h.eng.startEvents(ctx); err != nil {
+	if err := h.eng.startEvents(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		busy, err := h.eng.advanceAll(ctx, nil)
+		busy, err := h.eng.advanceAll(ctx, nil, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -488,5 +488,96 @@ func TestSweepSparesAnAgedPayloadWhoseIntakeHasNotCommitted(t *testing.T) {
 	}
 	if _, err := os.Stat(placed); err != nil {
 		t.Error("the committed event's payload was swept")
+	}
+}
+
+// Retrying purge after an interrupted deletion finishes it, instead of
+// reporting success while the confidential files stay.
+func TestPurgeRetryFinishesAnInterruptedDeletion(t *testing.T) {
+	h := newHarness(t, map[string][]string{"a": {"fail"}})
+	h.add(eventPipeline, true)
+	res, _ := h.trigger("p", "secret")
+	h.drain()
+	ctx := context.Background()
+	ev, _ := h.eng.Store.GetEvent(ctx, res.Event.ID)
+	if _, err := h.eng.Store.ClaimFilesDeletion(ctx, ev.RunID, h.now); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.eng.Purge(ctx, ev.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(ev.PayloadPath); !os.IsNotExist(err) {
+		t.Error("purge retry left the payload")
+	}
+	if _, err := os.Stat(h.eng.RunDir(ev.RunID)); !os.IsNotExist(err) {
+		t.Error("purge retry left the run directory")
+	}
+}
+
+// A schedule that is due again every time its run ends must not starve
+// queued events: whichever is older gets the slot.
+func TestDueScheduleDoesNotStarveQueuedEvents(t *testing.T) {
+	h := newHarness(t, nil)
+	// Frozen clock: the 1-minute schedule is due on every pass.
+	h.add("name: ev\nschedule: {interval: 1m}\nevents: {max_queued: 3}\nstages:\n  - {id: a, cmd: x}\n", true)
+	ctx := context.Background()
+	// The schedule has been due since before the event arrived; it goes
+	// first, then the event, even though the schedule is due again.
+	h.now = h.now.Add(30 * time.Second)
+	if _, err := h.trigger("e1", "x"); err != nil {
+		t.Fatal(err)
+	}
+	for range 4 {
+		if err := h.eng.schedule(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.eng.startEvents(ctx, ""); err != nil {
+			t.Fatal(err)
+		}
+		runs, _ := h.eng.Runs(ctx, "ev", 10)
+		h.eng.Store.FinishRun(ctx, runs[0].ID, store.RunSucceeded, "", "", h.now)
+		h.now = h.now.Add(2 * time.Minute) // longer than the interval
+	}
+	evs, _ := h.eng.Store.ListEvents(ctx, "ev", store.EventQueued, 10)
+	if len(evs) != 0 {
+		t.Fatalf("event starved: %d still queued after 4 slots", len(evs))
+	}
+	runs, _ := h.eng.Runs(ctx, "ev", 10)
+	if runs[len(runs)-1].Trigger != "schedule" || runs[len(runs)-2].Trigger != "event" {
+		t.Errorf("order %v; want the older schedule first, then the event", triggers(runs))
+	}
+}
+
+func triggers(rs []RunSummary) []string {
+	var out []string
+	for i := len(rs) - 1; i >= 0; i-- {
+		out = append(out, rs[i].Trigger)
+	}
+	return out
+}
+
+// The sweep must take its exclusive lock on a writable descriptor (NFS
+// emulates flock with fcntl locks, which need one) and must not mistake a
+// permanent locking error for an intake in progress.
+func TestSweepOpensCandidatesWritable(t *testing.T) {
+	h := newHarness(t, nil)
+	os.MkdirAll(h.eng.payloadDir(), 0o700)
+	ro := filepath.Join(h.eng.payloadDir(), "readonly.payload")
+	os.WriteFile(ro, []byte("x"), 0o400)
+	old := h.now.Add(-time.Hour)
+	os.Chtimes(ro, old, old)
+	err := h.eng.sweepOrphanPayloads(context.Background())
+	if os.Geteuid() == 0 {
+		// root can open a 0400 file read-write; the file is swept.
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, serr := os.Stat(ro); !os.IsNotExist(serr) {
+			t.Error("unreferenced old file not swept")
+		}
+		return
+	}
+	if err == nil {
+		t.Fatal("a file the sweep cannot open writable was silently treated as in use")
 	}
 }
