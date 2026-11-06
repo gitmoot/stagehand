@@ -244,6 +244,9 @@ stages:
 - When `max_queued` events are already waiting, a new trigger is refused and nothing is stored, so
   the caller knows to retry. Accepted events are never lost or run twice.
 - A disabled pipeline refuses events; its queued events wait until it is enabled again.
+- **Schedule and events on one pipeline:** whichever has waited longer gets the next run, the due
+  schedule or the oldest queued event. A schedule that is due again every time a run ends cannot
+  starve events, and a stream of events cannot starve the schedule.
 
 **What a stage sees.** The payload is passed **only as a file**. stagehand never puts event content
 into a command line or an environment value. Shell stages get:
@@ -305,7 +308,8 @@ stagehand trigger deck-review --event-id msg-123 --payload-file mail.eml [--cont
 - Reads the payload from stdin if `--payload-file` is not given.
 - Needs no signature: whoever can run it can already read the home.
 - `--wait` waits for the event's run and exits non-zero unless it succeeded. If no `serve` is
-  running, it runs the queued events itself.
+  running, it runs its own pipeline's queued events itself (in order, up to and including this
+  one) and returns as soon as this event's run ends.
 
 Related commands:
 
