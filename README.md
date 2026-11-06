@@ -187,7 +187,8 @@ Unit files and an example config are in [`deploy/`](deploy/).
   - To stop the run without failing it, a stage can write
     `{"decision":"blocked","summary":"…","needs":["…"]}` to `$STAGEHAND_RESULT`.
 - **What a shell stage sees:**
-  - `PATH`, `HOME` and `TZ` from the runner (each only if the runner has it), and `LANG=C.UTF-8`;
+  - `PATH` from the runner (a standard system `PATH` if it has none), `HOME` and `TZ` from the
+    runner only if it has them, and `LANG=C.UTF-8`;
   - `STAGEHAND_PIPELINE`, `STAGEHAND_RUN_ID`, `STAGEHAND_STAGE`, `STAGEHAND_ATTEMPT`;
   - `STAGEHAND_WORK`, the run's shared work directory, where stages pass files to each other;
   - `STAGEHAND_RESULT`;
