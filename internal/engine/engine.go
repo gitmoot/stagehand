@@ -58,8 +58,11 @@ type Engine struct {
 	// stopping is set once Loop is shutting down; advance then only folds
 	// results and never starts a stage.
 	stopping atomic.Bool
-	wake     chan struct{}
-	wg       sync.WaitGroup
+	// beforeEventCommit, if set (tests only), runs after an intake has
+	// placed its payload file and before its event commits.
+	beforeEventCommit func(payloadPath string)
+	wake              chan struct{}
+	wg                sync.WaitGroup
 }
 
 type flightKey struct {

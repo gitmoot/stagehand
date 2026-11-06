@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"syscall"
 	"time"
 
 	"github.com/gitmoot/stagehand/internal/spec"
@@ -99,6 +100,17 @@ func (e *Engine) Trigger(ctx context.Context, req EventRequest) (EventResult, er
 	if err != nil {
 		return EventResult{}, err
 	}
+	// The intake holds an exclusive lock on its payload file from creation
+	// until its event is committed (or abandoned). The lock follows the
+	// inode through the rename, and the orphan sweep skips any file it
+	// cannot lock, so a file that belongs to an intake in progress is never
+	// swept, however old its contents.
+	if err := syscall.Flock(int(tmp.Fd()), syscall.LOCK_EX); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return EventResult{}, fmt.Errorf("lock payload file: %w", err)
+	}
+	defer tmp.Close()           // releases the lock, after the commit below
 	defer os.Remove(tmp.Name()) // no-op once renamed
 	h := sha256.New()
 	limit := req.MaxBytes
@@ -106,8 +118,8 @@ func (e *Engine) Trigger(ctx context.Context, req EventRequest) (EventResult, er
 		limit = 64 << 20
 	}
 	n, err := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(req.Payload, limit+1))
-	if cerr := tmp.Close(); err == nil {
-		err = cerr
+	if err == nil {
+		err = tmp.Sync()
 	}
 	if err != nil {
 		return EventResult{}, fmt.Errorf("read payload: %w", err)
@@ -123,7 +135,13 @@ func (e *Engine) Trigger(ctx context.Context, req EventRequest) (EventResult, er
 		PayloadBytes: n, PayloadSHA256: hex.EncodeToString(h.Sum(nil)),
 	}
 	stored, dup, err := e.Store.InsertEvent(ctx, ev, sp.Events.MaxQueued, func() error {
-		return os.Rename(tmp.Name(), final)
+		if err := os.Rename(tmp.Name(), final); err != nil {
+			return err
+		}
+		if e.beforeEventCommit != nil {
+			e.beforeEventCommit(final)
+		}
+		return nil
 	})
 	if err != nil {
 		os.Remove(final)
@@ -248,9 +266,14 @@ func (e *Engine) removeRunFiles(ctx context.Context, r store.Run) error {
 
 // sweepOrphanPayloads removes payload files that no live event references:
 // leftovers of an intake interrupted before its commit, or of a drop or
-// deletion interrupted after its commit. Files modified within orphanAge are
-// never touched: an intake in another process may have placed its payload
-// and not committed yet.
+// deletion interrupted after its commit.
+//
+// It never races an intake: each intake holds an exclusive lock on its file
+// until its event is committed, and the sweep only removes a file whose lock
+// it holds itself, checking the committed live set after taking the lock. A
+// file whose lock it cannot take belongs to an intake in progress. Files
+// modified within orphanAge are skipped as well, which covers the instant
+// between an intake creating its file and locking it.
 func (e *Engine) sweepOrphanPayloads(ctx context.Context) error {
 	entries, err := os.ReadDir(e.payloadDir())
 	if errors.Is(err, os.ErrNotExist) {
@@ -259,30 +282,40 @@ func (e *Engine) sweepOrphanPayloads(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var old []string
 	for _, ent := range entries {
 		info, err := ent.Info()
-		if err != nil || e.now().Sub(info.ModTime()) < orphanAge {
+		if err != nil || !info.Mode().IsRegular() || e.now().Sub(info.ModTime()) < orphanAge {
 			continue
 		}
-		old = append(old, filepath.Join(e.payloadDir(), ent.Name()))
+		path := filepath.Join(e.payloadDir(), ent.Name())
+		if err := e.sweepOne(ctx, path); err != nil {
+			return err
+		}
 	}
-	if len(old) == 0 {
-		return nil
+	return nil
+}
+
+// sweepOne removes path if it is unlocked and no live event references it.
+func (e *Engine) sweepOne(ctx context.Context, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil // gone already
 	}
-	// Read the live set AFTER choosing candidates: any intake that placed
-	// one of them committed long ago (or never will).
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return nil // an intake holds it
+	}
+	// With the lock held, no intake can still be committing this file:
+	// whatever the live set says now is final for it.
 	live, err := e.Store.LivePayloadPaths(ctx)
 	if err != nil {
 		return err
 	}
-	for _, path := range old {
-		if live[path] {
-			continue
-		}
-		if err := os.Remove(path); err == nil {
-			e.Log.Warn("removed orphaned payload", "file", path)
-		}
+	if live[path] {
+		return nil
+	}
+	if err := os.Remove(path); err == nil {
+		e.Log.Warn("removed orphaned payload", "file", path)
 	}
 	return nil
 }

@@ -438,3 +438,55 @@ func TestDroppedEventNeverRunsEvenIfItsFileSurvives(t *testing.T) {
 		t.Fatal("a dropped event ran")
 	}
 }
+
+// The reviewer's scenario: a payload whose bytes were written long ago (a
+// slow producer that waited before closing) is placed just before a sweep in
+// another process, while its event has not committed. Its age must not make
+// it an orphan.
+func TestSweepSparesAnAgedPayloadWhoseIntakeHasNotCommitted(t *testing.T) {
+	h := newHarness(t, nil)
+	h.add(eventPipeline, true)
+	h.now = time.Now()
+	ctx := context.Background()
+	other, err := store.Open(ctx, filepath.Join(h.eng.Home, "stagehand.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	peer := New(other, h.eng.Home, nil, nil, nil)
+	peer.Now = func() time.Time { return h.now }
+	var placed string
+	h.eng.beforeEventCommit = func(path string) {
+		placed = path
+		old := h.now.Add(-2 * time.Hour)
+		os.Chtimes(path, old, old)
+		if err := peer.sweepOrphanPayloads(ctx); err != nil {
+			t.Error(err)
+		}
+	}
+	res, err := h.trigger("aged", "deck bytes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(placed); err != nil {
+		t.Fatalf("an aged payload of an uncommitted intake was swept: %v", err)
+	}
+	ev, _ := h.eng.Store.GetEvent(ctx, res.Event.ID)
+	if ev.State != store.EventQueued || ev.PayloadDeletedAt != nil {
+		t.Fatalf("event %+v", ev)
+	}
+	// Once committed and unlocked, a genuinely unreferenced old file goes.
+	stray := filepath.Join(h.eng.payloadDir(), "stray.payload")
+	os.WriteFile(stray, []byte("x"), 0o600)
+	old := h.now.Add(-2 * time.Hour)
+	os.Chtimes(stray, old, old)
+	if err := peer.sweepOrphanPayloads(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stray); !os.IsNotExist(err) {
+		t.Error("an unreferenced, unlocked old file was not swept")
+	}
+	if _, err := os.Stat(placed); err != nil {
+		t.Error("the committed event's payload was swept")
+	}
+}
