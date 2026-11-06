@@ -187,7 +187,7 @@ Unit files and an example config are in [`deploy/`](deploy/).
   - To stop the run without failing it, a stage can write
     `{"decision":"blocked","summary":"…","needs":["…"]}` to `$STAGEHAND_RESULT`.
 - **What a shell stage sees:**
-  - `PATH`, `HOME`, `LANG` and `TZ` from the runner;
+  - `PATH`, `HOME` and `TZ` from the runner (each only if the runner has it), and `LANG=C.UTF-8`;
   - `STAGEHAND_PIPELINE`, `STAGEHAND_RUN_ID`, `STAGEHAND_STAGE`, `STAGEHAND_ATTEMPT`;
   - `STAGEHAND_WORK`, the run's shared work directory, where stages pass files to each other;
   - `STAGEHAND_RESULT`;
@@ -442,6 +442,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Environment=HOME=/root
 ExecStart=/usr/local/bin/stagehand --home /var/lib/stagehand serve --status-addr 127.0.0.1:8795
 Restart=on-failure
 KillMode=control-group
@@ -455,6 +456,9 @@ WantedBy=multi-user.target
   `interrupted`, so they can be resumed later.
 - **Crashes:** `KillMode=control-group` makes systemd kill any stage processes left behind if the
   runner crashes.
+- **`HOME`:** systemd sets no `HOME` for a root service without `User=`, and stages get the
+  runner's `HOME` (or none). Set it, as above, if stages run tools that keep credentials there
+  (omp, herdr, gh); otherwise they work under `stagehand run` but fail under `serve`.
 
 ### Upgrading and rolling back
 

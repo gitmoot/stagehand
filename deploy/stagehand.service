@@ -8,6 +8,9 @@ Wants=network-online.target stagehand-hetzner2-tunnel.service stagehand-gateway-
 [Service]
 Type=simple
 Environment=STAGEHAND_HOME=/var/lib/stagehand
+# systemd sets no HOME for a root service without User=; shell stages inherit
+# this one (tools such as omp, herdr and gh find their credentials through it).
+Environment=HOME=/root
 Environment=STAGEHAND_CONFIG=/etc/stagehand/config.yaml
 # --trigger-addr: event intake (loopback only; needs events.secret_file in the config).
 ExecStart=/usr/local/bin/stagehand serve --status-addr 127.0.0.1:8797 --trigger-addr 127.0.0.1:8798
