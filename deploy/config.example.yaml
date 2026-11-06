@@ -11,3 +11,6 @@ agent:
     listen: 127.0.0.1:43293                  # reached from hetzner2's -fc-host-port via the tunnel (-R)
     guest_url: http://10.0.2.2:43293
     upstream: http://127.0.0.1:43295         # stagehand gateway-proxy on this host
+events:
+  secret_file: /etc/stagehand/trigger.key    # shared HMAC key for `serve --trigger-addr`, 0600
+  # max_payload_bytes: 67108864              # default 64 MiB
