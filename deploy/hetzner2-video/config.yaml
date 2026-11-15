@@ -10,10 +10,9 @@ agent:
   model_gateway:
     listen: 127.0.0.1:43298                  # the instance's guest host port
     guest_url: http://10.0.2.2:43298
-    # Credential route for guest model calls. Nothing listens here until the
-    # owner approves one (a tunnel to the fleet host's stagehand-gateway-proxy,
-    # or a local gateway-proxy with its own token); until then agent stages
-    # fail at their first model call and shell stages are unaffected.
+    # Reverse forward from the fleet host (stagehand-video-hetzner2-tunnel) to
+    # its stagehand-gateway-proxy, which adds the model credential there. No
+    # model credential is stored on hetzner2 (owner decision 2026-11-15).
     upstream: http://127.0.0.1:43299
 events:
   secret_file: /etc/stagehand-video/trigger.key   # HMAC key for the trigger endpoint, 0600

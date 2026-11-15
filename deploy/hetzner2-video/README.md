@@ -26,6 +26,13 @@ install -m 644 stagehand-video.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now stagehand-video
 ```
 
+On the fleet host:
+
+```sh
+install -m 644 fleet-host/stagehand-video-hetzner2-tunnel.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now stagehand-video-hetzner2-tunnel
+```
+
 ## Moving a pipeline here
 
 Never run a pipeline on both runners at once. Do the cutover between runs:
@@ -36,6 +43,20 @@ Never run a pipeline on both runners at once. Do the cutover between runs:
 
 ## Model credentials
 
-`agent.model_gateway.upstream` points at `127.0.0.1:43299`, where nothing listens until the owner
-approves a credential route. Until then, shell stages work and agent stages fail at their first
-model call.
+Owner decision, 2026-11-15: use a tunnel. No model credential is stored on hetzner2.
+
+- `agent.model_gateway.upstream` is `127.0.0.1:43299`. The fleet host's
+  `stagehand-video-hetzner2-tunnel.service` (`fleet-host/` here) reverse-forwards that port to its
+  own `stagehand-gateway-proxy` on `127.0.0.1:43295`, which adds the credential.
+- Guests never reach 43299. They hold only per-run tokens for the run gateway on 43298.
+- On hetzner2 only root can open 43299. The firewall rejects loopback for the CI runner uids
+  (`h2ci_*`, chain `ci`) and for the sandboxd jail uids (chain `guest`).
+- If the tunnel is down, agent stages fail at their first model call, and shell stages are
+  unaffected.
+
+## Resources
+
+The unit caps the runner and its shell stages at `MemoryMax=8G` and `MemoryHigh=7G`, with no
+swap, `CPUQuota=600%`, and CPU and IO weights of 50. These come from the hetzner2 memory budget.
+After the first week, check `memory.peak` in the unit's cgroup. If it stays under 5 GiB, lower
+the cap to 6 GiB.

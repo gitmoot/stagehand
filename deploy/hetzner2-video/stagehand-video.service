@@ -22,6 +22,16 @@ RestartSec=10
 KillMode=control-group
 TimeoutStopSec=60
 UMask=0077
+# hetzner2 memory budget (/root/fleet-tools/state/hetzner2-memory-budget.md,
+# approved by jarvis msg 488023, confirmed by keephair): covers the runner and
+# every shell stage it starts. Agent VMs are capped separately by sandboxd.
+MemoryMax=8G
+MemoryHigh=7G
+MemorySwapMax=0
+CPUQuota=600%
+CPUWeight=50
+IOWeight=50
+OOMScoreAdjust=300
 
 [Install]
 WantedBy=multi-user.target
