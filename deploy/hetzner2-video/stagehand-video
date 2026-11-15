@@ -1,0 +1,4 @@
+#!/bin/sh
+# Operator CLI for the video runner on hetzner2: plain `stagehand` there would
+# use (and create) the default home /var/lib/stagehand instead.
+STAGEHAND_HOME=/var/lib/stagehand-video STAGEHAND_CONFIG=/etc/stagehand-video/config.yaml exec /usr/local/bin/stagehand "$@"
