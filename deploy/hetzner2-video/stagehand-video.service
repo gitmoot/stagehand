@@ -1,0 +1,37 @@
+# Video runner on hetzner2 (gitmoot/stagehand#28): video pipelines run next to
+# their data there, not on the fleet host. Its own home, config, trigger key and
+# loopback ports, so it never shares state with another runner. Agent stages use
+# the local sandboxd instance "stagehandvid" (operated by the sandboxd seat).
+[Unit]
+Description=stagehand video pipeline runner
+After=network-online.target sandboxd-stagehandvid.service
+Wants=network-online.target sandboxd-stagehandvid.service
+
+[Service]
+Type=simple
+Environment=STAGEHAND_HOME=/var/lib/stagehand-video
+Environment=STAGEHAND_CONFIG=/etc/stagehand-video/config.yaml
+# systemd sets no HOME for a root service without User=; shell stages inherit
+# this one (tools such as omp, herdr and gh find their credentials through it).
+Environment=HOME=/root
+ExecStart=/usr/local/bin/stagehand serve --status-addr 127.0.0.1:8807 --trigger-addr 127.0.0.1:8808
+Restart=on-failure
+RestartSec=10
+# Stop sends SIGTERM: running stages are stopped and their runs parked as
+# interrupted. control-group also kills anything a crashed runner left.
+KillMode=control-group
+TimeoutStopSec=60
+UMask=0077
+# hetzner2 memory budget (/root/fleet-tools/state/hetzner2-memory-budget.md,
+# approved by jarvis msg 488023, confirmed by keephair): covers the runner and
+# every shell stage it starts. Agent VMs are capped separately by sandboxd.
+MemoryMax=8G
+MemoryHigh=7G
+MemorySwapMax=0
+CPUQuota=600%
+CPUWeight=50
+IOWeight=50
+OOMScoreAdjust=300
+
+[Install]
+WantedBy=multi-user.target

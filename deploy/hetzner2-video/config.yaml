@@ -1,0 +1,18 @@
+# /etc/stagehand-video/config.yaml on hetzner2 (gitmoot/stagehand#28)
+agent:
+  executor: sandboxd
+  sandboxd:
+    url: http://127.0.0.1:43297              # local sandboxd instance "stagehandvid"
+    api_key_file: /var/lib/sandboxd-stagehandvid/api-key   # the instance's own key (0600 root); not copied
+    template: stagehand-omp-strict
+    guest_omp: /usr/local/bin/omp
+    max_ttl: 1h
+  model_gateway:
+    listen: 127.0.0.1:43298                  # the instance's guest host port
+    guest_url: http://10.0.2.2:43298
+    # Reverse forward from the fleet host (stagehand-video-hetzner2-tunnel) to
+    # its stagehand-gateway-proxy, which adds the model credential there. No
+    # model credential is stored on hetzner2 (owner decision 2026-11-15).
+    upstream: http://127.0.0.1:43299
+events:
+  secret_file: /etc/stagehand-video/trigger.key   # HMAC key for the trigger endpoint, 0600
