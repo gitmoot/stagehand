@@ -748,6 +748,13 @@ func TestCancelReachesARetryStartedDuringTeardown(t *testing.T) {
 			}
 		}
 	}
+	// Attempt 1's teardown is complete once its slot is given back: both
+	// attempts held one, so the agent count drops from 2 to 1.
+	tornDown := func() bool {
+		h.eng.mu.Lock()
+		defer h.eng.mu.Unlock()
+		return h.eng.running[spec.KindAgent] == 1
+	}
 	h.add("name: p\nstages:\n  - {id: r, agent: omp, prompt: x, output: o.json, max_cost: 1, timeout: 1m, retry: 1}\n", false)
 	id := h.start("p")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -759,7 +766,11 @@ func TestCancelReachesARetryStartedDuringTeardown(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the retry never started")
 	}
-	time.Sleep(100 * time.Millisecond) // attempt 1's teardown has now run
+	for deadline := time.Now().Add(5 * time.Second); !tornDown(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("attempt 1's teardown did not finish")
+		}
+	}
 	if err := h.eng.Cancel(context.Background(), id); err != nil {
 		t.Fatal(err)
 	}
