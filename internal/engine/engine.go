@@ -48,7 +48,7 @@ type Engine struct {
 	Poll   time.Duration
 
 	mu       sync.Mutex
-	inflight map[flightKey]context.CancelCauseFunc
+	inflight map[flightKey]flight
 	// liveResources are tracked by attempts still running in this process;
 	// the cleanup sweep leaves them alone.
 	liveResources map[string]bool
@@ -58,6 +58,9 @@ type Engine struct {
 	// stopping is set once Loop is shutting down; advance then only folds
 	// results and never starts a stage.
 	stopping atomic.Bool
+	// afterFinishAttempt, if set (tests only), runs after an attempt's
+	// result is recorded and before its in-flight entry is removed.
+	afterFinishAttempt func(run int64, stage string, attempt int)
 	// beforeEventCommit, if set (tests only), runs after an intake has
 	// placed its payload file and before its event commits.
 	beforeEventCommit func(payloadPath string)
@@ -68,6 +71,14 @@ type Engine struct {
 type flightKey struct {
 	run   int64
 	stage string
+}
+
+// flight is the attempt currently running for a flightKey. A retry can start
+// while the previous attempt's goroutine is still tearing down, so teardown
+// removes the entry only if it is still its own attempt's.
+type flight struct {
+	attempt int
+	cancel  context.CancelCauseFunc
 }
 
 // New returns an engine with defaults filled in.
@@ -84,7 +95,7 @@ func New(st *store.Store, home string, executors map[spec.Kind]stage.Executor, b
 		Jitter:        defaultJitter,
 		Log:           log,
 		Poll:          DefaultPoll,
-		inflight:      map[flightKey]context.CancelCauseFunc{},
+		inflight:      map[flightKey]flight{},
 		liveResources: map[string]bool{},
 		running:       map[spec.Kind]int{},
 		wake:          make(chan struct{}, 1),
@@ -438,8 +449,8 @@ func (e *Engine) stopAll(only map[int64]bool) {
 	e.stopping.Store(true)
 	defer e.stopping.Store(false)
 	e.mu.Lock()
-	for _, cancel := range e.inflight {
-		cancel(errStopping)
+	for _, f := range e.inflight {
+		f.cancel(errStopping)
 	}
 	e.mu.Unlock()
 	e.wg.Wait()

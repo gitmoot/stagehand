@@ -25,6 +25,7 @@ import (
 	"github.com/gitmoot/stagehand/internal/config"
 	"github.com/gitmoot/stagehand/internal/engine"
 	"github.com/gitmoot/stagehand/internal/homelock"
+	"github.com/gitmoot/stagehand/internal/modelgw"
 	"github.com/gitmoot/stagehand/internal/sandboxd"
 	"github.com/gitmoot/stagehand/internal/shellexec"
 	"github.com/gitmoot/stagehand/internal/spec"
@@ -230,14 +231,19 @@ func open(ctx context.Context, home, configPath string, stderr io.Writer) (*app,
 			st.Close()
 			return nil, fmt.Errorf("agent.sandboxd.api_key_file: %w", err)
 		}
+		gw, err := modelgw.NewGateway(cfg.Agent.ModelGateway.Listen, cfg.Agent.ModelGateway.Upstream, log)
+		if err != nil {
+			st.Close()
+			return nil, err
+		}
 		executors[spec.KindAgent] = agentexec.Executor{Backend: agentexec.Sandboxd{
 			Client:          &sandboxd.Client{BaseURL: strings.TrimRight(sc.URL, "/"), APIKey: key},
 			Template:        sc.Template,
 			GuestOmp:        sc.GuestOmpPath(),
 			MaxTTL:          sc.MaxTTLDuration(),
-			GatewayListen:   cfg.Agent.ModelGateway.Listen,
+			Gateway:         gw,
 			GuestGatewayURL: cfg.Agent.ModelGateway.GuestURL,
-			GatewayUpstream: cfg.Agent.ModelGateway.Upstream,
+			MaxParallel:     sc.MaxParallel,
 			Log:             log,
 		}}
 	}

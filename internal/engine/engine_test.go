@@ -705,3 +705,76 @@ func TestLimitedExecutorQueuesStagesAcrossRuns(t *testing.T) {
 		t.Errorf("overlap=%v ran=%d; want two sequential attempts", lim.overlap, lim.ran)
 	}
 }
+
+// retryExec fails attempt 1 at once; later attempts run until cancelled.
+type retryExec struct {
+	slots     int
+	retryRuns chan struct{} // closed when attempt 2 starts executing
+	stopped   chan error    // attempt 2's context cause when it ends
+}
+
+func (r *retryExec) MaxConcurrent() int { return r.slots }
+
+func (r *retryExec) Execute(ctx context.Context, job stage.Job) stage.Result {
+	if job.Attempt == 1 {
+		return stage.Result{Outcome: stage.Failed, Summary: "first try fails"}
+	}
+	close(r.retryRuns)
+	select {
+	case <-ctx.Done():
+		r.stopped <- context.Cause(ctx)
+		return stage.Result{Outcome: stage.Failed, Summary: "stopped"}
+	case <-time.After(20 * time.Second):
+		r.stopped <- nil
+		return stage.Result{Outcome: stage.Succeeded}
+	}
+}
+
+// With a spare slot (max_parallel > 1), a retry can start while the failed
+// attempt's goroutine is still tearing down. That teardown must not remove
+// the retry's in-flight entry, or cancelling the run never reaches the
+// retry, which keeps its VM and model access until its own timeout.
+func TestCancelReachesARetryStartedDuringTeardown(t *testing.T) {
+	h := newHarness(t, nil)
+	ex := &retryExec{slots: 2, retryRuns: make(chan struct{}), stopped: make(chan error, 1)}
+	h.eng.Executors[spec.KindAgent] = ex
+	// Hold attempt 1's teardown (after its result is recorded) until the
+	// retry is executing: the interleaving the race needs.
+	h.eng.afterFinishAttempt = func(_ int64, _ string, attempt int) {
+		if attempt == 1 {
+			select {
+			case <-ex.retryRuns:
+			case <-time.After(10 * time.Second):
+			}
+		}
+	}
+	h.add("name: p\nstages:\n  - {id: r, agent: omp, prompt: x, output: o.json, max_cost: 1, timeout: 1m, retry: 1}\n", false)
+	id := h.start("p")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	loopDone := make(chan error, 1)
+	go func() { loopDone <- h.eng.Loop(ctx, LoopOptions{Only: map[int64]bool{id: true}, UntilIdle: true}) }()
+	select {
+	case <-ex.retryRuns:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the retry never started")
+	}
+	time.Sleep(100 * time.Millisecond) // attempt 1's teardown has now run
+	if err := h.eng.Cancel(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case cause := <-ex.stopped:
+		if !errors.Is(cause, errCancelled) {
+			t.Fatalf("retry ended with %v, want cancelled", cause)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelling the run did not reach the retry")
+	}
+	if err := <-loopDone; err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := h.eng.Run(context.Background(), id); d.State != store.RunCancelled {
+		t.Errorf("run %s, want cancelled", d.State)
+	}
+}

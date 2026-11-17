@@ -7,6 +7,7 @@ agent:
     template: stagehand-omp-strict
     guest_omp: /usr/local/bin/omp
     max_ttl: 1h
+    max_parallel: 1                          # agent stages at once; at most the instance's -max-vms
   model_gateway:
     listen: 127.0.0.1:43293                  # reached from hetzner2's -fc-host-port via the tunnel (-R)
     guest_url: http://10.0.2.2:43293

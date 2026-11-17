@@ -46,16 +46,17 @@ type Sandboxd struct {
 	GuestOmp string
 	// MaxTTL is the instance's -max-ttl; VM lifetimes are capped to it.
 	MaxTTL time.Duration
-	// GatewayListen is where the run gateway listens on this host: the
-	// loopback side of the instance's -fc-host-port.
-	GatewayListen string
+	// Gateway is the runner's run gateway, listening on the loopback side of
+	// the instance's -fc-host-port. Concurrent attempts share it; each is
+	// admitted by its own token.
+	Gateway *modelgw.Gateway
 	// GuestGatewayURL is the same port as the guest sees it
 	// (http://10.0.2.2:<port>).
 	GuestGatewayURL string
-	// GatewayUpstream is where model calls go next (the tunnel to the
-	// credential proxy).
-	GatewayUpstream string
-	Log             *slog.Logger
+	// MaxParallel is how many agent stages may run at once; it must not
+	// exceed the instance's -max-vms. Below 1 means 1.
+	MaxParallel int
+	Log         *slog.Logger
 }
 
 // Run creates a VM, runs omp in it, and destroys it.
@@ -64,7 +65,7 @@ func (s Sandboxd) Run(ctx context.Context, req Request, onLine func([]byte)) (in
 	if err != nil {
 		return 0, err
 	}
-	gw, err := modelgw.StartRunGateway(s.GatewayListen, s.GatewayUpstream, token, s.Log)
+	gw, err := s.Gateway.Open(token)
 	if err != nil {
 		return 0, err
 	}
@@ -179,9 +180,9 @@ func (s Sandboxd) Run(ctx context.Context, req Request, onLine func([]byte)) (in
 	return code, err
 }
 
-// MaxConcurrent is 1: the instance exposes one host port, which one run
-// gateway at a time listens on.
-func (Sandboxd) MaxConcurrent() int { return 1 }
+// MaxConcurrent is the configured parallelism: the shared run gateway admits
+// any number of attempts, so the instance's VM limit is what bounds it.
+func (s Sandboxd) MaxConcurrent() int { return max(s.MaxParallel, 1) }
 
 // Cleanup destroys every VM created under a recorded job id. It reports done
 // once a listing shows none left AND the recorded settle time has passed, so

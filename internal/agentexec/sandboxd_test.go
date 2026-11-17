@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gitmoot/stagehand/internal/modelgw"
 	"github.com/gitmoot/stagehand/internal/sandboxd"
 	"github.com/gitmoot/stagehand/internal/stage"
 )
@@ -38,6 +40,9 @@ type fakeSandboxd struct {
 	truncateCreate bool
 	// createDelay allocates only after this long, even if the client left.
 	createDelay time.Duration
+	// ompHook, if set, runs when omp starts, with the env it was given.
+	ompHook func(env map[string]any)
+	nextID  int
 }
 
 func (f *fakeSandboxd) liveCount() int {
@@ -62,7 +67,12 @@ func (f *fakeSandboxd) handler() http.Handler {
 		time.Sleep(delay)
 		f.mu.Lock()
 		f.created = append(f.created, body)
-		f.live["sandboxd-abc"] = meta["job_id"].(string)
+		id := "sandboxd-abc"
+		if f.nextID > 0 {
+			id = fmt.Sprintf("sandboxd-%d", f.nextID)
+		}
+		f.nextID++
+		f.live[id] = meta["job_id"].(string)
 		truncate := f.truncateCreate
 		f.mu.Unlock()
 		w.WriteHeader(201)
@@ -70,7 +80,7 @@ func (f *fakeSandboxd) handler() http.Handler {
 			w.Write([]byte(`{"sandboxID":"sandboxd-a`))
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]any{"sandboxID": "sandboxd-abc", "envdAccessToken": "tok", "templateID": body["templateID"]})
+		json.NewEncoder(w).Encode(map[string]any{"sandboxID": id, "envdAccessToken": "tok", "templateID": body["templateID"]})
 	})
 	mux.HandleFunc("GET /v2/sandboxes", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -94,7 +104,10 @@ func (f *fakeSandboxd) handler() http.Handler {
 		w.WriteHeader(204)
 	})
 	mux.HandleFunc("POST /files", func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Access-Token") != "tok" || r.Header.Get("E2b-Sandbox-Id") != "sandboxd-abc" {
+		f.mu.Lock()
+		_, known := f.live[r.Header.Get("E2b-Sandbox-Id")]
+		f.mu.Unlock()
+		if r.Header.Get("X-Access-Token") != "tok" || !known {
 			http.Error(w, "no", 401)
 			return
 		}
@@ -126,6 +139,10 @@ func (f *fakeSandboxd) handler() http.Handler {
 		frame(0, map[string]any{"event": map[string]any{"start": map[string]any{"pid": 7}}})
 		code := 0
 		if req.Process["cmd"] == "/opt/omp" {
+			if f.ompHook != nil {
+				env, _ := req.Process["envs"].(map[string]any)
+				f.ompHook(env)
+			}
 			for _, l := range f.ompLines {
 				// Split each line across two data events to exercise line joining.
 				half := len(l) / 2
@@ -152,14 +169,17 @@ func newFake(t *testing.T) (*fakeSandboxd, Sandboxd, string) {
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	addr := ln.Addr().String()
 	ln.Close()
+	gw, err := modelgw.NewGateway(addr, "http://127.0.0.1:1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	be := Sandboxd{
 		Client:          &sandboxd.Client{BaseURL: srv.URL, APIKey: "key"},
 		Template:        "stagehand-omp-strict",
 		GuestOmp:        "/opt/omp",
 		MaxTTL:          time.Hour,
-		GatewayListen:   addr,
+		Gateway:         gw,
 		GuestGatewayURL: "http://10.0.2.2:43293",
-		GatewayUpstream: "http://127.0.0.1:1",
 	}
 	return f, be, addr
 }
@@ -348,5 +368,89 @@ func TestSandboxdCleanupIgnoresOtherResources(t *testing.T) {
 	}
 	if !slices.Equal(f.deleted, []string{"sandboxd-old"}) {
 		t.Errorf("deleted %v; must touch only the recorded job's VM", f.deleted)
+	}
+}
+
+// Two agent attempts run at once through one run gateway: each guest's own
+// token reaches the model while the other attempt is still running.
+func TestSandboxdConcurrentAttemptsShareTheGateway(t *testing.T) {
+	f, be, addr := newFake(t)
+	f.ompLines = []string{msg(`{"ok":true}`, 0.1), end}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	t.Cleanup(up.Close)
+	gw, err := modelgw.NewGateway(addr, up.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	be.Gateway, be.MaxParallel = gw, 2
+	if be.MaxConcurrent() != 2 {
+		t.Fatalf("MaxConcurrent %d, want the configured 2", be.MaxConcurrent())
+	}
+	// Both guests are inside omp before either makes its model call, so the
+	// attempts overlap for certain. The wait is bounded: if the second
+	// attempt cannot start, the first must still finish (and fail the test)
+	// rather than hold the fake server open.
+	var inside sync.WaitGroup
+	inside.Add(2)
+	both := make(chan struct{})
+	go func() { inside.Wait(); close(both) }()
+	var mu sync.Mutex
+	var statuses []int
+	overlapped := 0
+	f.ompHook = func(env map[string]any) {
+		inside.Done()
+		select {
+		case <-both:
+			mu.Lock()
+			overlapped++
+			mu.Unlock()
+		case <-time.After(5 * time.Second):
+		}
+		req, _ := http.NewRequest("POST", "http://"+addr+"/v1/messages", strings.NewReader("{}"))
+		req.Header.Set("X-Api-Key", fmt.Sprint(env["ANTHROPIC_API_KEY"]))
+		code := 0
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			code = resp.StatusCode
+			resp.Body.Close()
+		}
+		mu.Lock()
+		statuses = append(statuses, code)
+		mu.Unlock()
+	}
+	var done sync.WaitGroup
+	results := make([]stage.Result, 2)
+	for i := range 2 {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			results[i] = Executor{Backend: be}.Execute(context.Background(), newJob(t, 1))
+		}()
+	}
+	finished := make(chan struct{})
+	go func() { done.Wait(); close(finished) }()
+	select {
+	case <-finished:
+	case <-time.After(20 * time.Second):
+		t.Fatal("concurrent attempts did not finish; the second could not start")
+	}
+	for i, r := range results {
+		if r.Outcome != stage.Succeeded {
+			t.Errorf("attempt %d: %+v", i, r)
+		}
+	}
+	if overlapped != 2 {
+		t.Fatalf("%d of 2 attempts saw the other running; agent stages did not run at once", overlapped)
+	}
+	if len(statuses) != 2 || statuses[0] != 200 || statuses[1] != 200 {
+		t.Errorf("model calls during overlap: %v; want both 200", statuses)
+	}
+	if f.liveCount() != 0 {
+		t.Errorf("%d VMs left", f.liveCount())
+	}
+	if c, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
+		c.Close()
+		t.Error("gateway still listening after both attempts ended")
 	}
 }

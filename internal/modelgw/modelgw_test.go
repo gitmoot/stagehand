@@ -44,26 +44,42 @@ func freeAddr(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-func TestRunGatewayAdmitsOnlyItsTokenAndStripsIt(t *testing.T) {
+func newGateway(t *testing.T, addr, upstream string) *Gateway {
+	t.Helper()
+	g, err := NewGateway(addr, upstream, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return g
+}
+
+func post(t *testing.T, addr, token string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest("POST", "http://"+addr+"/v1/messages", strings.NewReader("{}"))
+	if token != "" {
+		req.Header.Set("X-Api-Key", token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func TestGatewayAdmitsOnlyOpenTokensAndStripsThem(t *testing.T) {
 	got := make(chan seen, 4)
 	up := upstream(t, got)
 	token, _ := NewToken()
 	addr := freeAddr(t)
-	g, err := StartRunGateway(addr, up.URL, token, nil)
+	g := newGateway(t, addr, up.URL)
+	sess, err := g.Open(token)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer g.Close()
+	defer sess.Close()
 
 	for _, bad := range []string{"", "wrong", token[:len(token)-1] + "x"} {
-		req, _ := http.NewRequest("POST", "http://"+addr+"/v1/messages", strings.NewReader("{}"))
-		if bad != "" {
-			req.Header.Set("X-Api-Key", bad)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
+		resp := post(t, addr, bad)
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Errorf("token %q: status %d, want 401", bad, resp.StatusCode)
@@ -75,12 +91,7 @@ func TestRunGatewayAdmitsOnlyItsTokenAndStripsIt(t *testing.T) {
 	default:
 	}
 
-	req, _ := http.NewRequest("POST", "http://"+addr+"/v1/messages", strings.NewReader("{}"))
-	req.Header.Set("X-Api-Key", token)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := post(t, addr, token)
 	defer resp.Body.Close()
 	s := <-got
 	if s.apiKey != "" || s.auth != "" || s.path != "/v1/messages" {
@@ -92,28 +103,141 @@ func TestRunGatewayAdmitsOnlyItsTokenAndStripsIt(t *testing.T) {
 	if line != "data: one\n" || time.Since(start) > 200*time.Millisecond {
 		t.Errorf("stream not flushed: %q after %v", line, time.Since(start))
 	}
-	if g.Requests() != 1 {
-		t.Errorf("served %d", g.Requests())
+	if sess.Requests() != 1 {
+		t.Errorf("served %d", sess.Requests())
 	}
 }
 
-func TestRunGatewayClosesWithItsStage(t *testing.T) {
-	token, _ := NewToken()
+// Concurrent attempts share the port. Each is admitted by its own token,
+// and closing one revokes only that token: the other keeps working, and the
+// closed one is refused at once.
+func TestGatewaySessionsAreIndependent(t *testing.T) {
+	got := make(chan seen, 8)
+	up := upstream(t, got)
 	addr := freeAddr(t)
-	g, err := StartRunGateway(addr, "http://127.0.0.1:1", token, nil)
+	g := newGateway(t, addr, up.URL)
+	t1, _ := NewToken()
+	t2, _ := NewToken()
+	s1, err := g.Open(t1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := StartRunGateway(addr, "http://127.0.0.1:1", token, nil); err == nil {
-		t.Error("two run gateways on one address")
+	s2, err := g.Open(t2)
+	if err != nil {
+		t.Fatalf("second concurrent session: %v", err)
 	}
-	g.Close()
+	defer s2.Close()
+	for _, tok := range []string{t1, t2} {
+		resp := post(t, addr, tok)
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("open token: status %d", resp.StatusCode)
+		}
+	}
+	if s1.Requests() != 1 || s2.Requests() != 1 {
+		t.Errorf("per-session counts %d, %d; want 1, 1", s1.Requests(), s2.Requests())
+	}
+	s1.Close()
+	resp := post(t, addr, t1)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("closed session's token: status %d, want 401", resp.StatusCode)
+	}
+	resp = post(t, addr, t2)
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("other session after a close: status %d, want 200", resp.StatusCode)
+	}
+	if _, err := g.Open(t2); err == nil {
+		t.Error("the same token opened twice")
+	}
+}
+
+// Closing a session cuts its own streaming call, not the other's.
+func TestGatewayCloseCutsOnlyItsOwnStreams(t *testing.T) {
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: one\n\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		io.WriteString(w, "data: two\n\n")
+	}))
+	t.Cleanup(up.Close)
+	t.Cleanup(func() { close(release) })
+	addr := freeAddr(t)
+	g := newGateway(t, addr, up.URL)
+	t1, _ := NewToken()
+	t2, _ := NewToken()
+	s1, _ := g.Open(t1)
+	s2, _ := g.Open(t2)
+	defer s2.Close()
+	r1, r2 := post(t, addr, t1), post(t, addr, t2)
+	defer r1.Body.Close()
+	defer r2.Body.Close()
+	b1, b2 := bufio.NewReader(r1.Body), bufio.NewReader(r2.Body)
+	// Consume the whole first event ("data: one" and its blank line), so
+	// the next byte on each stream is the second event.
+	for _, b := range []*bufio.Reader{b1, b2} {
+		b.ReadString('\n')
+		b.ReadString('\n')
+	}
+	s1.Close()
+	ended := make(chan error, 1)
+	go func() { _, err := io.ReadAll(b1); ended <- err }()
+	select {
+	case <-ended:
+	case <-time.After(3 * time.Second):
+		t.Fatal("closed session's stream still open")
+	}
+	// The other stream is still live: it is waiting for its next event.
+	alive := make(chan struct{})
+	go func() { b2.Peek(1); close(alive) }()
+	select {
+	case <-alive:
+		t.Fatal("the other session's stream ended when one session closed")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// The port is bound while a session is open and free once the last one
+// closes, so another runner (or the next start) can bind it.
+func TestGatewayHoldsThePortOnlyWhileSessionsAreOpen(t *testing.T) {
+	addr := freeAddr(t)
+	g := newGateway(t, addr, "http://127.0.0.1:1")
+	t1, _ := NewToken()
+	t2, _ := NewToken()
+	s1, err := g.Open(t1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, _ := g.Open(t2)
+	s1.Close()
+	if c, err := net.DialTimeout("tcp", addr, time.Second); err != nil {
+		t.Fatal("port released while a session is still open")
+	} else {
+		c.Close()
+	}
+	s2.Close()
 	if c, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
 		c.Close()
-		t.Error("gateway still listening after Close")
+		t.Error("gateway still listening after the last session closed")
 	}
-	if _, err := StartRunGateway("0.0.0.0:0", "http://127.0.0.1:1", token, nil); err == nil {
+	if _, err := NewGateway("0.0.0.0:0", "http://127.0.0.1:1", nil); err == nil {
 		t.Error("non-loopback listen accepted")
+	}
+	// A port someone else holds is reported, not silently shared.
+	other := newGateway(t, addr, "http://127.0.0.1:1")
+	held, _ := other.Open(t1)
+	defer held.Close()
+	if _, err := g.Open(t2); err == nil {
+		t.Error("two gateways bound one address")
 	}
 }
 
@@ -153,14 +277,20 @@ func TestCredentialProxyReplacesCredentials(t *testing.T) {
 
 // Close must release the port before it returns, even when it races the
 // Serve goroutine's start: the next attempt binds the same port at once.
-func TestRunGatewayPortIsFreeRightAfterClose(t *testing.T) {
-	token, _ := NewToken()
+func TestGatewayPortIsFreeRightAfterLastClose(t *testing.T) {
 	addr := freeAddr(t)
+	g := newGateway(t, addr, "http://127.0.0.1:1")
 	for i := range 300 {
-		g, err := StartRunGateway(addr, "http://127.0.0.1:1", token, nil)
+		token, _ := NewToken()
+		s, err := g.Open(token)
 		if err != nil {
 			t.Fatalf("iteration %d: %v", i, err)
 		}
-		g.Close()
+		s.Close()
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			t.Fatalf("iteration %d: port still bound: %v", i, err)
+		}
+		ln.Close()
 	}
 }

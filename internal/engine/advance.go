@@ -41,9 +41,9 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 
 	if run.CancelRequested {
 		e.mu.Lock()
-		for k, cancel := range e.inflight {
+		for k, f := range e.inflight {
 			if k.run == run.ID {
-				cancel(errCancelled)
+				f.cancel(errCancelled)
 			}
 		}
 		e.mu.Unlock()
@@ -307,7 +307,7 @@ func (e *Engine) start(ctx context.Context, run store.Run, sp spec.Spec, stg spe
 	jctx, stopTimer := context.WithTimeoutCause(base, timeout, fmt.Errorf("timed out after %s", timeout))
 	key := flightKey{run.ID, stg.ID}
 	e.mu.Lock()
-	e.inflight[key] = cancel
+	e.inflight[key] = flight{attempt: a.Attempt, cancel: cancel}
 	e.mu.Unlock()
 	e.wg.Add(1)
 	e.Log.Info("stage started", "run", run.ID, "stage", stg.ID, "attempt", a.Attempt, "kind", stg.Kind())
@@ -349,8 +349,16 @@ func (e *Engine) start(ctx context.Context, run store.Run, sp spec.Spec, stg spe
 		e.Log.Info("stage finished", "run", run.ID, "stage", stg.ID, "attempt", a.Attempt, "state", a.State,
 			"exit", exitString(a.ExitCode), "cost", a.Cost, "summary", firstLine(a.Summary))
 
+		if e.afterFinishAttempt != nil {
+			e.afterFinishAttempt(run.ID, stg.ID, a.Attempt)
+		}
 		e.mu.Lock()
-		delete(e.inflight, key)
+		// Once the result is recorded, a retry may already have taken this
+		// key; its entry is not ours to remove, or cancel and shutdown would
+		// no longer reach it.
+		if f, ok := e.inflight[key]; ok && f.attempt == a.Attempt {
+			delete(e.inflight, key)
+		}
 		e.running[stg.Kind()]--
 		for _, r := range tracked {
 			delete(e.liveResources, r)
