@@ -389,14 +389,25 @@ func TestSandboxdConcurrentAttemptsShareTheGateway(t *testing.T) {
 		t.Fatalf("MaxConcurrent %d, want the configured 2", be.MaxConcurrent())
 	}
 	// Both guests are inside omp before either makes its model call, so the
-	// attempts overlap for certain.
+	// attempts overlap for certain. The wait is bounded: if the second
+	// attempt cannot start, the first must still finish (and fail the test)
+	// rather than hold the fake server open.
 	var inside sync.WaitGroup
 	inside.Add(2)
+	both := make(chan struct{})
+	go func() { inside.Wait(); close(both) }()
 	var mu sync.Mutex
 	var statuses []int
+	overlapped := 0
 	f.ompHook = func(env map[string]any) {
 		inside.Done()
-		inside.Wait()
+		select {
+		case <-both:
+			mu.Lock()
+			overlapped++
+			mu.Unlock()
+		case <-time.After(5 * time.Second):
+		}
 		req, _ := http.NewRequest("POST", "http://"+addr+"/v1/messages", strings.NewReader("{}"))
 		req.Header.Set("X-Api-Key", fmt.Sprint(env["ANTHROPIC_API_KEY"]))
 		code := 0
@@ -428,6 +439,9 @@ func TestSandboxdConcurrentAttemptsShareTheGateway(t *testing.T) {
 		if r.Outcome != stage.Succeeded {
 			t.Errorf("attempt %d: %+v", i, r)
 		}
+	}
+	if overlapped != 2 {
+		t.Fatalf("%d of 2 attempts saw the other running; agent stages did not run at once", overlapped)
 	}
 	if len(statuses) != 2 || statuses[0] != 200 || statuses[1] != 200 {
 		t.Errorf("model calls during overlap: %v; want both 200", statuses)
