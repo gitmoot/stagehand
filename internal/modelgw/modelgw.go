@@ -1,11 +1,11 @@
 // Package modelgw carries an agent's model calls to omp's auth-gateway
 // without the agent ever holding a real credential.
 //
-//	guest omp ──(per-run token)──▶ RunGateway ──▶ … ──▶ CredentialProxy ──(gateway bearer)──▶ omp auth-gateway
+//	guest omp ──(per-attempt token)──▶ Gateway ──▶ … ──▶ CredentialProxy ──(gateway bearer)──▶ omp auth-gateway
 //
-// RunGateway runs inside `stagehand serve` next to the sandbox, only while an
-// agent stage runs. It accepts nothing but that run's random token, strips
-// it, and forwards. CredentialProxy runs on the host that holds the omp
+// The run gateway (Gateway) runs inside the runner next to the sandbox, while
+// agent stages run. It accepts only the random tokens of attempts still
+// running, strips them, and forwards. CredentialProxy runs on the host that holds the omp
 // auth-gateway token (`stagehand gateway-proxy`): it adds the bearer token and
 // forwards to the auth-gateway. Between them is a loopback tunnel.
 package modelgw
@@ -13,6 +13,7 @@ package modelgw
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
@@ -24,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -85,19 +87,33 @@ func checkLoopback(addr string) error {
 	return nil
 }
 
-// RunGateway is a listener that admits exactly one token.
-type RunGateway struct {
-	token  string
-	srv    *http.Server
-	ln     net.Listener
-	done   chan struct{} // closed when Serve returns
-	served atomic.Int64
+// Gateway is the run gateway: one loopback listener (the sandboxd
+// instance's single host port) shared by every agent attempt of this runner.
+// Each attempt opens a Session with its own random token; a request is
+// forwarded only while its token's session is open. The listener is bound
+// while at least one session is open, and released when the last closes.
+type Gateway struct {
+	listen string
+	up     *url.URL
+	log    *slog.Logger
+
+	life sync.Mutex // serialises binding and releasing the listener
+	srv  *http.Server
+	ln   net.Listener
+	done chan struct{} // closed when Serve returns
+
+	mu       sync.Mutex
+	sessions map[[sha256.Size]byte]*session
 }
 
-// StartRunGateway listens on listen (a loopback address the sandbox can
-// reach through its host port) and forwards requests carrying token to
-// upstream. Close it when the stage ends.
-func StartRunGateway(listen, upstream, token string, log *slog.Logger) (*RunGateway, error) {
+type session struct {
+	served atomic.Int64
+	ctx    context.Context // cancelled when the session closes
+	cancel context.CancelFunc
+}
+
+// NewGateway validates the addresses; nothing is bound until Open.
+func NewGateway(listen, upstream string, log *slog.Logger) (*Gateway, error) {
 	if err := checkLoopback(listen); err != nil {
 		return nil, fmt.Errorf("run gateway: %w", err)
 	}
@@ -105,45 +121,88 @@ func StartRunGateway(listen, upstream, token string, log *slog.Logger) (*RunGate
 	if err != nil || (up.Scheme != "http" && up.Scheme != "https") || up.Host == "" {
 		return nil, fmt.Errorf("run gateway: upstream %q must be an http(s) URL", upstream)
 	}
+	return &Gateway{listen: listen, up: up, log: log, sessions: map[[sha256.Size]byte]*session{}}, nil
+}
+
+// Session is one attempt's admission to the gateway.
+type Session struct {
+	g    *Gateway
+	key  [sha256.Size]byte
+	s    *session
+	once sync.Once
+}
+
+// Open admits token until the returned session is closed, binding the
+// listener if no other session holds it. Tokens are compared by their
+// SHA-256, so the lookup leaks nothing about a valid token's bytes.
+func (g *Gateway) Open(token string) (*Session, error) {
 	if len(token) < 32 {
 		return nil, errors.New("run gateway: token too short")
 	}
-	ln, err := net.Listen("tcp", listen)
-	if err != nil {
-		return nil, fmt.Errorf("run gateway: %w (is another agent stage running?)", err)
+	key := sha256.Sum256([]byte(token))
+	g.life.Lock()
+	defer g.life.Unlock()
+	if g.srv == nil {
+		if err := g.bind(); err != nil {
+			return nil, err
+		}
 	}
-	g := &RunGateway{token: token, ln: ln}
-	proxy := newProxy(up, nil)
-	g.srv = &http.Server{
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &session{ctx: ctx, cancel: cancel}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, dup := g.sessions[key]; dup {
+		cancel()
+		return nil, errors.New("run gateway: token already open")
+	}
+	g.sessions[key] = s
+	return &Session{g: g, key: key, s: s}, nil
+}
+
+// bind starts the listener; g.life is held.
+func (g *Gateway) bind() error {
+	ln, err := net.Listen("tcp", g.listen)
+	if err != nil {
+		return fmt.Errorf("run gateway: %w (is another runner using this sandboxd instance?)", err)
+	}
+	proxy := newProxy(g.up, nil)
+	srv := &http.Server{
 		ReadHeaderTimeout: 10 * time.Second,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !equal(presented(r), g.token) {
-				if log != nil {
-					log.Warn("run gateway: rejected request", "path", r.URL.Path, "remote", r.RemoteAddr)
+			key := sha256.Sum256([]byte(presented(r)))
+			g.mu.Lock()
+			s := g.sessions[key]
+			g.mu.Unlock()
+			if s == nil {
+				if g.log != nil {
+					g.log.Warn("run gateway: rejected request", "path", r.URL.Path, "remote", r.RemoteAddr)
 				}
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
-			g.served.Add(1)
-			proxy.ServeHTTP(w, r)
+			s.served.Add(1)
+			// The call ends when its attempt does, even mid-stream.
+			ctx, cancel := context.WithCancel(r.Context())
+			defer cancel()
+			stop := context.AfterFunc(s.ctx, cancel)
+			defer stop()
+			proxy.ServeHTTP(w, r.WithContext(ctx))
 		}),
 	}
-	g.done = make(chan struct{})
+	done := make(chan struct{})
 	go func() {
-		defer close(g.done)
-		_ = g.srv.Serve(ln)
+		defer close(done)
+		_ = srv.Serve(ln)
 	}()
-	return g, nil
+	g.srv, g.ln, g.done = srv, ln, done
+	return nil
 }
 
-// Requests is how many authorized requests were forwarded.
-func (g *RunGateway) Requests() int64 { return g.served.Load() }
-
-// Close releases the port before it returns, then drains open requests for
-// up to 2s and cuts the rest. Closing the listener directly (instead of only
-// Shutdown) matters: Shutdown does not close a listener that Serve has not
-// registered yet, which would leave the port bound after Close.
-func (g *RunGateway) Close() error {
+// release stops the listener; g.life is held. The port is free when it
+// returns. Closing the listener directly (instead of only Shutdown) matters:
+// Shutdown does not close a listener that Serve has not registered yet,
+// which would leave the port bound.
+func (g *Gateway) release() error {
 	lnErr := g.ln.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -151,10 +210,35 @@ func (g *RunGateway) Close() error {
 		_ = g.srv.Close()
 	}
 	<-g.done
+	g.srv, g.ln, g.done = nil, nil, nil
 	if lnErr != nil && !errors.Is(lnErr, net.ErrClosed) {
 		return lnErr
 	}
 	return nil
+}
+
+// Requests is how many authorized requests this session forwarded.
+func (s *Session) Requests() int64 { return s.s.served.Load() }
+
+// Close revokes the token at once, cuts its in-flight requests, and
+// releases the listener if this was the last open session. Other sessions
+// are unaffected.
+func (s *Session) Close() error {
+	var err error
+	s.once.Do(func() {
+		g := s.g
+		g.life.Lock()
+		defer g.life.Unlock()
+		g.mu.Lock()
+		delete(g.sessions, s.key)
+		last := len(g.sessions) == 0
+		g.mu.Unlock()
+		s.s.cancel()
+		if last {
+			err = g.release()
+		}
+	})
+	return err
 }
 
 // CredentialProxy adds the auth-gateway bearer token to every request.

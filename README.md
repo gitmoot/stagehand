@@ -159,6 +159,7 @@ agent:
     template: stagehand-omp-strict
     guest_omp: /usr/local/bin/omp            # default
     max_ttl: 1h                              # the instance's -max-ttl
+    max_parallel: 1                          # agent stages at once; at most the instance's -max-vms
   model_gateway:
     listen: 127.0.0.1:43293                  # reached from the instance's -fc-host-port (tunnel -R)
     guest_url: http://10.0.2.2:43293
@@ -167,9 +168,14 @@ agent:
 
 - **Which models work:** the VM's omp gets only `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`
   (the token for that attempt), so `anthropic/*` models work through this path.
-- **One stage at a time:** each instance has one host port, so only one agent stage runs at a
-  time. Agent stages that become ready meanwhile, in any pipeline, wait as `pending` and start
-  when the slot frees; their time limit starts only then.
+- **How many at once:** up to `max_parallel` agent stages run at the same time (default 1),
+  across all pipelines of the runner. Set it no higher than the instance's `-max-vms`; sandboxd
+  refuses a VM beyond that, and the stage fails. Agent stages that become ready while every slot
+  is taken wait as `pending` and start when one frees; their time limit starts only then.
+- **One gateway, many attempts:** an instance has a single host port, and every VM of it reaches
+  that port. The runner listens there while any agent stage runs, and gives each attempt its own
+  random token. A call is forwarded only while its attempt runs, so one attempt cannot use
+  another's model access, and a finished attempt's token stops working at once.
 - **Crash recovery:** the sandbox job id is recorded before the VM is requested. Cleanup finds
   VMs by that id in the instance's inventory, so even a VM whose create response was lost gets
   destroyed.

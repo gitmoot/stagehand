@@ -65,6 +65,10 @@ type Agent struct {
 	ModelGateway ModelGateway `yaml:"model_gateway"`
 }
 
+// maxParallelLimit bounds agent.sandboxd.max_parallel: a typo such as 30
+// for 3 should fail at load, not ask sandboxd for thirty VMs.
+const maxParallelLimit = 8
+
 // Sandboxd locates the sandboxd instance that runs agent stages.
 type Sandboxd struct {
 	// URL is the instance's -listen address, e.g. http://127.0.0.1:43292.
@@ -77,6 +81,9 @@ type Sandboxd struct {
 	GuestOmp string `yaml:"guest_omp"`
 	// MaxTTL is the instance's -max-ttl (default 1h).
 	MaxTTL string `yaml:"max_ttl"`
+	// MaxParallel is how many agent stages run at once (default 1). It must
+	// not exceed the instance's -max-vms, or the extra creates are refused.
+	MaxParallel int `yaml:"max_parallel"`
 }
 
 // ModelGateway is where agents' model calls go.
@@ -147,6 +154,9 @@ func (c Config) Validate() error {
 			if d, err := time.ParseDuration(s.MaxTTL); err != nil || d <= 0 {
 				errs = append(errs, fmt.Errorf("agent.sandboxd.max_ttl %q must be a positive duration", s.MaxTTL))
 			}
+		}
+		if s.MaxParallel < 0 || s.MaxParallel > maxParallelLimit {
+			errs = append(errs, fmt.Errorf("agent.sandboxd.max_parallel %d must be between 1 and %d (0 means 1)", s.MaxParallel, maxParallelLimit))
 		}
 		if host, _, err := net.SplitHostPort(g.Listen); err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
 			errs = append(errs, fmt.Errorf("agent.model_gateway.listen %q must be a loopback host:port", g.Listen))
