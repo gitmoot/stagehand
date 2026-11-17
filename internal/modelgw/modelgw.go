@@ -14,7 +14,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -52,10 +51,6 @@ func presented(r *http.Request) string {
 		return a
 	}
 	return ""
-}
-
-func equal(a, b string) bool {
-	return len(a) == len(b) && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 func newProxy(upstream *url.URL, prepare func(*http.Request)) *httputil.ReverseProxy {
