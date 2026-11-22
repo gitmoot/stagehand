@@ -53,13 +53,17 @@ func newGateway(t *testing.T, addr, upstream string) *Gateway {
 	return g
 }
 
+// post sends one model call as a guest would. Each call gets its own client:
+// every agent attempt is a separate VM with its own connections, and a
+// shared client could let one guest's cut connection disturb another's.
 func post(t *testing.T, addr, token string) *http.Response {
 	t.Helper()
 	req, _ := http.NewRequest("POST", "http://"+addr+"/v1/messages", strings.NewReader("{}"))
 	if token != "" {
 		req.Header.Set("X-Api-Key", token)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	guest := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err := guest.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
