@@ -31,6 +31,9 @@ type PipelineStatus struct {
 	LastRun      *RunSummary  `json:"last_run"`
 	SpecHash     string       `json:"spec_hash"`
 	Error        string       `json:"error,omitempty"`
+	// LimitedUntil is set while a usage limit recorded on the pipeline
+	// lasts: scheduled slots before it are skipped without running.
+	LimitedUntil *time.Time `json:"limited_until,omitempty"`
 }
 
 // RunSummary is a run without its stage detail.
@@ -50,6 +53,8 @@ type RunSummary struct {
 	Event *EventRef `json:"event,omitempty"`
 	// FilesDeletedAt: the run's files and payload were deleted (retention).
 	FilesDeletedAt *time.Time `json:"files_deleted_at,omitempty"`
+	// LimitedUntil: a usage limit skipped the run; it lasts until then.
+	LimitedUntil *time.Time `json:"limited_until,omitempty"`
 }
 
 // EventRef identifies the event behind a run. The payload itself is never
@@ -94,6 +99,9 @@ type StageDetail struct {
 	Needs      []string        `json:"needs,omitempty"`
 	StartedAt  *time.Time      `json:"started_at"`
 	FinishedAt *time.Time      `json:"finished_at"`
+	// LimitedUntil: the stage waits out (pending) or was skipped by a usage
+	// limit that lasts until then.
+	LimitedUntil *time.Time `json:"limited_until,omitempty"`
 }
 
 // AttemptDetail is one attempt of a stage.
@@ -109,6 +117,8 @@ type AttemptDetail struct {
 	Summary      string     `json:"summary,omitempty"`
 	StartedAt    time.Time  `json:"started_at"`
 	FinishedAt   *time.Time `json:"finished_at"`
+	// LimitedUntil: the attempt hit a usage limit that lasts until then.
+	LimitedUntil *time.Time `json:"limited_until,omitempty"`
 }
 
 // Status reports every pipeline with its schedule, next due time and newest
@@ -147,6 +157,13 @@ func (e *Engine) Status(ctx context.Context, version string) (Status, error) {
 		if active != 0 {
 			ps.ActiveRunID = &active
 		}
+		until, err := e.Store.PipelineLimitedUntil(ctx, p.Name)
+		if err != nil {
+			return Status{}, err
+		}
+		if until != nil && until.After(out.GeneratedAt) {
+			ps.LimitedUntil = until
+		}
 		out.Pipelines = append(out.Pipelines, ps)
 	}
 	return out, nil
@@ -177,7 +194,7 @@ func (e *Engine) summarize(ctx context.Context, r store.Run) (RunSummary, error)
 	sum := RunSummary{
 		ID: r.ID, Pipeline: r.Pipeline, Trigger: r.Trigger, State: r.State, CreatedAt: r.CreatedAt,
 		FinishedAt: r.FinishedAt, HaltStage: r.HaltStage, HaltReason: r.HaltReason,
-		Cost: cost, InputTokens: in, OutputTokens: out, FilesDeletedAt: r.FilesDeletedAt,
+		Cost: cost, InputTokens: in, OutputTokens: out, FilesDeletedAt: r.FilesDeletedAt, LimitedUntil: r.LimitedUntil,
 	}
 	if r.EventID != 0 {
 		ev, err := e.Store.GetEvent(ctx, r.EventID)
@@ -213,13 +230,13 @@ func (e *Engine) Run(ctx context.Context, id int64) (RunDetail, error) {
 		byStage[a.StageID] = append(byStage[a.StageID], AttemptDetail{
 			Attempt: a.Attempt, State: a.State, ExitCode: a.ExitCode, Cost: a.Cost,
 			InputTokens: a.InputTokens, OutputTokens: a.OutputTokens, LogPath: a.LogPath,
-			Resource: a.Resource, Summary: a.Summary, StartedAt: a.StartedAt, FinishedAt: a.FinishedAt,
+			Resource: a.Resource, Summary: a.Summary, StartedAt: a.StartedAt, FinishedAt: a.FinishedAt, LimitedUntil: a.LimitedUntil,
 		})
 	}
 	d := RunDetail{RunSummary: sum, SpecHash: r.SpecHash, CancelRequested: r.CancelRequested, Stages: []StageDetail{}}
 	for _, st := range stages {
 		sd := StageDetail{ID: st.StageID, State: st.State, Summary: st.Summary, StartedAt: st.StartedAt, FinishedAt: st.FinishedAt,
-			Attempts: byStage[st.StageID]}
+			LimitedUntil: st.LimitedUntil, Attempts: byStage[st.StageID]}
 		if sd.Attempts == nil {
 			sd.Attempts = []AttemptDetail{}
 		}

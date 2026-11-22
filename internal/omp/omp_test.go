@@ -2,6 +2,7 @@ package omp
 
 import (
 	"bufio"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -104,6 +105,55 @@ func TestCostAddsUpEveryAssistantMessageIncludingFailedOnes(t *testing.T) {
 	s := feed(errorMsg, toolMsg, answerMsg, agentEnd)
 	if got := s.Cost(); got < 0.7999 || got > 0.8001 {
 		t.Errorf("cost %v, want 0.8", got)
+	}
+}
+
+// Run 2718's shape: the provider's 429 named a wait far beyond the 5 minutes
+// omp sits out, so omp ended the turn and gave up retrying.
+const (
+	limit429   = `Anthropic stream error (api_error): 429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your rate limit."}}`
+	limitTurn  = limit429 + ` retry-after-ms=12769000`
+	limitFinal = `Provider requested 12769000ms wait, exceeds retry.maxDelayMs (300000ms). Original error: ` + limit429
+)
+
+func failedTurn(errorMessage string) string {
+	quoted, _ := json.Marshal(errorMessage)
+	return `{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":` + string(quoted) + `,"content":[]}}`
+}
+
+func gaveUp(finalError string) string {
+	quoted, _ := json.Marshal(finalError)
+	return `{"type":"auto_retry_end","success":false,"finalError":` + string(quoted) + `}`
+}
+
+func TestUsageLimit(t *testing.T) {
+	const retryStart = `{"type":"auto_retry_start"}`
+	cases := []struct {
+		name  string
+		lines []string
+		want  time.Duration // 0 = not a usage limit
+	}{
+		{"failed turn names retry-after-ms", []string{failedTurn(limitTurn), agentEnd}, 12769 * time.Second},
+		{"omp gave up on the provider's wait", []string{retryStart, gaveUp(limitFinal), agentEnd}, 12769 * time.Second},
+		{"run 2718: both", []string{failedTurn(limitTurn), retryStart, gaveUp(limitFinal), agentEnd}, 12769 * time.Second},
+		{"rate_limit without a status", []string{failedTurn(`rate_limit_error: slow down retry-after-ms=600000`), agentEnd}, 10 * time.Minute},
+		{"429 without retry-after", []string{failedTurn(limit429), agentEnd}, 0},
+		{"gave up on a 429 without a wait", []string{retryStart, gaveUp(`429 rate_limit_error`), agentEnd}, 0},
+		{"retry-after on another error", []string{failedTurn(`500 api_error retry-after-ms=4290`), agentEnd}, 0},
+		{"recovered", []string{failedTurn(limitTurn), retryStart, `{"type":"auto_retry_end","success":true}`, answerMsg, agentEnd}, 0},
+		{"recovered, then another failure", []string{failedTurn(limitTurn), answerMsg, failedTurn("500 overloaded"), agentEnd}, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := feed(c.lines...)
+			got, ok := s.UsageLimit()
+			if ok != (c.want != 0) || got != c.want {
+				t.Fatalf("UsageLimit() = %v, %v; want %v", got, ok, c.want)
+			}
+			if _, err := s.Result(); c.want != 0 && err == nil {
+				t.Fatal("a usage limit must not be a result")
+			}
+		})
 	}
 }
 

@@ -104,3 +104,33 @@ func TestTriggerWaitReturnsWhenItsOwnRunIsDone(t *testing.T) {
 		t.Fatal("trigger --wait did not return after its own run finished")
 	}
 }
+
+// A run a usage limit skips is not a failure: `run --wait` exits 75
+// (EX_TEMPFAIL), not 1, and says the next slot runs as usual.
+func TestRunWaitExitsTempFailWhenAUsageLimitSkipsTheRun(t *testing.T) {
+	home := t.TempDir()
+	dir := t.TempDir()
+	limit429 := `Anthropic stream error (api_error): 429 {"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}`
+	turn, _ := json.Marshal(limit429 + " retry-after-ms=12769000")
+	stream := `{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":` + string(turn) + `,"content":[]}}` + "\n" +
+		`{"type":"agent_end","isTerminal":true}` + "\n"
+	streamPath := filepath.Join(dir, "stream.jsonl")
+	omp := filepath.Join(dir, "omp")
+	os.WriteFile(streamPath, []byte(stream), 0o600)
+	os.WriteFile(omp, []byte("#!/bin/sh\ncat "+streamPath+"\n"), 0o700)
+	os.WriteFile(filepath.Join(home, "config.yaml"), []byte("agent:\n  executor: local\n  allow_unsafe_local: true\n  omp: "+omp+"\n"), 0o600)
+	os.WriteFile(filepath.Join(dir, "lim.yaml"), []byte("name: lim\nstages:\n  - {id: r, agent: omp, prompt: x, output: o.json, max_cost: 1, timeout: 1m}\n"), 0o600)
+	if code, _, errs := runCLI(home, "add", filepath.Join(dir, "lim.yaml")); code != 0 {
+		t.Fatal(errs)
+	}
+	code, out, errs := runCLI(home, "run", "lim", "--wait")
+	if code != 75 {
+		t.Fatalf("exit %d, want 75\nstdout: %s\nstderr: %s", code, out, errs)
+	}
+	if !strings.Contains(errs, "run #1 skipped: usage limit until ") || !strings.Contains(errs, "; the next slot runs as usual") {
+		t.Errorf("stderr %q", errs)
+	}
+	if !strings.Contains(out, "halted at r: usage limit until ") {
+		t.Errorf("stdout %q", out)
+	}
+}

@@ -67,6 +67,10 @@ func (f *fakeExec) Execute(ctx context.Context, job stage.Job) stage.Result {
 	case "hang":
 		<-ctx.Done()
 		return stage.Result{Outcome: stage.Failed, Summary: "stopped"}
+	case "limit-short": // within the default usage_limit_wait (2m)
+		return stage.Result{Outcome: stage.Limited, Summary: "usage limit (retry after 1m0s): 429", RetryAfter: time.Minute}
+	case "limit-long":
+		return stage.Result{Outcome: stage.Limited, Summary: "usage limit (retry after 5h0m0s): 429", RetryAfter: 5 * time.Hour}
 	}
 	panic("unknown step " + step)
 }

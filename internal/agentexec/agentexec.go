@@ -153,6 +153,12 @@ func (x Executor) Execute(ctx context.Context, job stage.Job) stage.Result {
 	}
 	answer, err := stream.Result()
 	if err != nil {
+		if after, ok := stream.UsageLimit(); ok {
+			// The provider's usage limit, not a fault of the stage: the
+			// engine waits or skips the run instead of failing it.
+			res.RetryAfter = after
+			return finish(stage.Limited, fmt.Sprintf("usage limit (retry after %s): %v", after.Round(time.Second), err))
+		}
 		if exitCode != 0 {
 			return finish(stage.Failed, fmt.Sprintf("omp exited %d: %v", exitCode, err))
 		}

@@ -26,6 +26,10 @@ import (
 // DefaultPoll is how often the loop re-reads the store when nothing wakes it.
 const DefaultPoll = 5 * time.Second
 
+// DefaultUsageLimitWait is the longest provider usage limit a stage waits
+// out (once) instead of skipping its run.
+const DefaultUsageLimitWait = 2 * time.Minute
+
 var (
 	errCancelled = errors.New("cancelled by operator")
 	errStopping  = errors.New("interrupted: the runner stopped while this stage ran")
@@ -46,6 +50,10 @@ type Engine struct {
 	Jitter func(max time.Duration) time.Duration
 	Log    *slog.Logger
 	Poll   time.Duration
+	// UsageLimitWait is the longest usage limit a stage waits out before
+	// retrying once; a longer one skips the run. Zero means
+	// DefaultUsageLimitWait.
+	UsageLimitWait time.Duration
 
 	mu       sync.Mutex
 	inflight map[flightKey]flight
@@ -110,6 +118,13 @@ func defaultJitter(max time.Duration) time.Duration {
 }
 
 func (e *Engine) now() time.Time { return e.Now().UTC() }
+
+func (e *Engine) usageLimitWait() time.Duration {
+	if e.UsageLimitWait > 0 {
+		return e.UsageLimitWait
+	}
+	return DefaultUsageLimitWait
+}
 
 func (e *Engine) signal() {
 	select {
@@ -214,19 +229,36 @@ func (e *Engine) StartRun(ctx context.Context, name, trigger string) (int64, err
 }
 
 func (e *Engine) createRun(ctx context.Context, p store.Pipeline, sp spec.Spec, trigger string) (int64, error) {
-	ids := make([]string, len(sp.Stages))
-	for i, st := range sp.Stages {
-		ids[i] = st.ID
-	}
 	id, err := e.Store.CreateRun(ctx, store.Run{
 		Pipeline: p.Name, Trigger: trigger, SpecYAML: p.SpecYAML, SpecHash: p.SpecHash,
 		SourceDir: p.SourceDir, CreatedAt: e.now(),
-	}, ids)
+	}, stageIDs(sp))
 	if err == nil {
 		e.Log.Info("run created", "pipeline", p.Name, "run", id, "trigger", trigger)
 		e.signal()
 	}
 	return id, err
+}
+
+// skipRun records a run that a usage limit lasting until until skips before
+// any of its stages starts.
+func (e *Engine) skipRun(ctx context.Context, p store.Pipeline, sp spec.Spec, trigger string, until time.Time) (int64, error) {
+	id, err := e.Store.CreateSkippedRun(ctx, store.Run{
+		Pipeline: p.Name, Trigger: trigger, SpecYAML: p.SpecYAML, SpecHash: p.SpecHash,
+		SourceDir: p.SourceDir, CreatedAt: e.now(),
+	}, stageIDs(sp), until)
+	if err == nil {
+		e.Log.Info("run skipped", "pipeline", p.Name, "run", id, "trigger", trigger, "reason", store.UsageLimitReason(until))
+	}
+	return id, err
+}
+
+func stageIDs(sp spec.Spec) []string {
+	ids := make([]string, len(sp.Stages))
+	for i, st := range sp.Stages {
+		ids[i] = st.ID
+	}
+	return ids
 }
 
 // Resume re-runs a parked run from a stage: that stage, everything that
@@ -240,6 +272,11 @@ func (e *Engine) Resume(ctx context.Context, runID int64, from string) error {
 	sp, err := spec.Load(run.SpecYAML)
 	if err != nil {
 		return fmt.Errorf("run %d spec snapshot: %w", runID, err)
+	}
+	if run.State == store.RunSkipped {
+		// Refused before --from is needed: a slot skipped before it started
+		// has no halted stage. ResumeRun refuses it too.
+		return fmt.Errorf("run %d: %w", runID, store.ErrSkippedRun)
 	}
 	if from == "" {
 		from = run.HaltStage

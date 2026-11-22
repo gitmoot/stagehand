@@ -65,3 +65,40 @@ func TestInsertEventIsIdempotentInsideTheTransaction(t *testing.T) {
 		t.Errorf("payload placed %d times", placed)
 	}
 }
+
+// A slot a usage limit skips is recorded while another run of the pipeline
+// is running: it never exists as running itself. The pipeline's limit is the
+// latest end as a time, even where RFC 3339 text sorts it first (a trimmed
+// fraction: "11:00:00.5Z" < "11:00:00Z").
+func TestSkippedRunsAndPipelineLimitedUntil(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "stagehand.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	base := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)
+	r := Run{Pipeline: "p", Trigger: "schedule", SpecYAML: []byte("x"), SpecHash: "h", SourceDir: "/", CreatedAt: base}
+	if _, err := s.CreateRun(ctx, r, []string{"a"}); err != nil {
+		t.Fatal(err)
+	}
+	later := base.Add(time.Hour + 500*time.Millisecond)
+	earlier := base.Add(time.Hour)
+	for _, until := range []time.Time{later, earlier} {
+		id, err := s.CreateSkippedRun(ctx, r, []string{"a"}, until)
+		if err != nil {
+			t.Fatalf("skipped run beside a running one: %v", err)
+		}
+		got, err := s.GetRun(ctx, id)
+		if err != nil || got.State != RunSkipped || got.HaltReason != UsageLimitReason(until) || got.LimitedUntil == nil ||
+			!got.LimitedUntil.Equal(until) || got.FinishedAt == nil {
+			t.Fatalf("skipped run %+v, %v", got, err)
+		}
+	}
+	if until, err := s.PipelineLimitedUntil(ctx, "p"); err != nil || until == nil || !until.Equal(later) {
+		t.Errorf("pipeline limited until %v, %v; want %v", until, err, later)
+	}
+	if until, err := s.PipelineLimitedUntil(ctx, "other"); err != nil || until != nil {
+		t.Errorf("pipeline without limits: %v, %v", until, err)
+	}
+}

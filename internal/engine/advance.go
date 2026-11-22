@@ -57,7 +57,7 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 		}
 		a, ok := latest[st.StageID]
 		if !ok || a.Attempt != st.Attempts {
-			if err := e.foldStage(ctx, st, store.StageFailed, "no record of the running attempt", nil); err != nil {
+			if err := e.foldStage(ctx, st, store.StageFailed, "no record of the running attempt", nil, nil); err != nil {
 				return true, err
 			}
 			continue
@@ -68,6 +68,8 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 		stg, _ := sp.Stage(st.StageID)
 		var state string
 		var needs []string
+		var limitedUntil *time.Time
+		summary := a.Summary
 		switch a.State {
 		case store.AttemptSucceeded:
 			state = store.StageSucceeded
@@ -84,10 +86,12 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 				state = store.StagePending
 				e.Log.Info("stage will retry", "run", run.ID, "stage", st.StageID, "attempt", st.Attempts, "summary", a.Summary)
 			}
+		case store.AttemptLimited:
+			state, summary, limitedUntil = e.foldLimited(run, st, a, attempts)
 		default: // interrupted: never retried automatically
 			state = store.StageFailed
 		}
-		if err := e.foldStage(ctx, st, state, a.Summary, needs); err != nil {
+		if err := e.foldStage(ctx, st, state, summary, needs, limitedUntil); err != nil {
 			return true, err
 		}
 	}
@@ -105,7 +109,7 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 		}
 		for i := range stages {
 			if stages[i].State == store.StagePending {
-				if err := e.foldStage(ctx, &stages[i], store.StageCancelled, "cancelled before it ran", nil); err != nil {
+				if err := e.foldStage(ctx, &stages[i], store.StageCancelled, "cancelled before it ran", nil, nil); err != nil {
 					return true, err
 				}
 			}
@@ -127,7 +131,7 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 		}
 		stg, ok := sp.Stage(st.StageID)
 		if !ok {
-			if err := e.foldStage(ctx, st, store.StageFailed, "stage is not in the run's spec", nil); err != nil {
+			if err := e.foldStage(ctx, st, store.StageFailed, "stage is not in the run's spec", nil, nil); err != nil {
 				return true, err
 			}
 			continue
@@ -140,6 +144,12 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 			}
 		}
 		if !ready {
+			continue
+		}
+		if st.LimitedUntil != nil && e.now().Before(*st.LimitedUntil) {
+			// Waiting out a short usage limit: take no slot, and keep the
+			// run open until the limit ends.
+			waiting = true
 			continue
 		}
 		if e.stopping.Load() {
@@ -190,11 +200,30 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 	}
 	final := store.RunBlocked
 	var haltStage, haltReason string
+	// The stage a usage limit skipped (the latest limit, if several).
+	var limitStage string
+	var limitUntil time.Time
 	for _, st := range stages {
 		switch st.State {
 		case store.StageFailed, store.StageCancelled:
 			final = store.RunFailed
+		case store.StageSkipped:
+			if st.LimitedUntil != nil && (limitStage == "" || st.LimitedUntil.After(limitUntil)) {
+				limitStage, limitUntil = st.StageID, *st.LimitedUntil
+			}
 		}
+	}
+	if final != store.RunFailed && limitStage != "" {
+		reason := store.UsageLimitReason(limitUntil)
+		for i := range stages {
+			if stages[i].State == store.StagePending {
+				if err := e.foldStage(ctx, &stages[i], store.StageSkipped, "not run: "+reason, nil, nil); err != nil {
+					return true, err
+				}
+			}
+		}
+		e.Log.Info("run skipped", "run", run.ID, "stage", limitStage, "reason", reason)
+		return false, e.Store.FinishRunSkipped(ctx, run.ID, limitStage, limitUntil, e.now())
 	}
 	for _, st := range stages {
 		if st.State == store.StageFailed || st.State == store.StageBlocked || st.State == store.StageCancelled {
@@ -204,7 +233,7 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 	}
 	for i := range stages {
 		if stages[i].State == store.StagePending {
-			if err := e.foldStage(ctx, &stages[i], store.StageSkipped, "not run: an upstream stage did not succeed", nil); err != nil {
+			if err := e.foldStage(ctx, &stages[i], store.StageSkipped, "not run: an upstream stage did not succeed", nil, nil); err != nil {
 				return true, err
 			}
 		}
@@ -213,9 +242,47 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 	return false, e.Store.FinishRun(ctx, run.ID, final, haltStage, strings.TrimSuffix(haltReason, ": "), e.now())
 }
 
-func (e *Engine) foldStage(ctx context.Context, st *store.RunStage, state, summary string, needs []string) error {
+// foldLimited decides what a usage-limited attempt does to its stage. A
+// short limit (ending within UsageLimitWait) is waited out once: the stage
+// stays pending until the limit ends, then retries outside its retry budget.
+// Otherwise (a long limit, a second one, or a run being cancelled) the stage
+// is skipped, which ends the run skipped. An event run's stage blocks
+// instead: the event is not delivered again, so its run must stay resumable.
+func (e *Engine) foldLimited(run store.Run, st *store.RunStage, a store.Attempt, attempts []store.Attempt) (state, summary string, until *time.Time) {
+	now := e.now()
+	end := now
+	if a.LimitedUntil != nil {
+		end = *a.LimitedUntil
+	}
+	if !run.CancelRequested && end.Sub(now) <= e.usageLimitWait() && !limitedBefore(attempts, a) {
+		st.RetryBase++
+		e.Log.Info("stage waits out a usage limit", "run", run.ID, "stage", st.StageID, "attempt", a.Attempt, "until", end)
+		return store.StagePending, a.Summary, &end
+	}
+	reason := store.UsageLimitReason(end)
+	if run.EventID != 0 {
+		return store.StageBlocked, reason + "; resume after it", nil
+	}
+	return store.StageSkipped, reason, &end
+}
+
+// limitedBefore reports whether an earlier attempt of a's stage in the run
+// hit a usage limit.
+func limitedBefore(attempts []store.Attempt, a store.Attempt) bool {
+	for _, b := range attempts {
+		if b.StageID == a.StageID && b.Attempt < a.Attempt && b.State == store.AttemptLimited {
+			return true
+		}
+	}
+	return false
+}
+
+// foldStage records a stage's new state. limitedUntil is kept only when
+// given: every other transition clears it.
+func (e *Engine) foldStage(ctx context.Context, st *store.RunStage, state, summary string, needs []string, limitedUntil *time.Time) error {
 	st.State = state
 	st.Summary = summary
+	st.LimitedUntil = limitedUntil
 	st.NeedsJSON = ""
 	if len(needs) > 0 {
 		raw, _ := json.Marshal(needs)
@@ -248,6 +315,7 @@ func (e *Engine) start(ctx context.Context, run store.Run, sp spec.Spec, stg spe
 		return false, err
 	}
 	st.State = store.StageRunning
+	st.LimitedUntil = nil
 
 	fail := func(summary string) (bool, error) {
 		end := e.now()
@@ -337,6 +405,10 @@ func (e *Engine) start(ctx context.Context, run store.Run, sp spec.Spec, stg spe
 				raw, _ := json.Marshal(res.Needs)
 				a.NeedsJSON = string(raw)
 			}
+		case res.Outcome == stage.Limited:
+			a.State = store.AttemptLimited
+			until := end.Add(res.RetryAfter)
+			a.LimitedUntil = &until
 		default:
 			a.State = store.AttemptFailed
 			if a.Summary == "" {
@@ -472,7 +544,19 @@ func (e *Engine) schedule(ctx context.Context) error {
 				continue // an older event goes first; the schedule stays due
 			}
 		}
-		if _, err := e.createRun(ctx, p, sp, "schedule"); err != nil && !errors.Is(err, store.ErrActiveRun) {
+		until, err := e.limitedSlot(ctx, p.Name, sp, now)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if until != nil {
+			// A usage limit still holds: record the slot as skipped
+			// without starting anything.
+			if _, err := e.skipRun(ctx, p, sp, "schedule", *until); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+		} else if _, err := e.createRun(ctx, p, sp, "schedule"); err != nil && !errors.Is(err, store.ErrActiveRun) {
 			errs = append(errs, err)
 			continue
 		}
@@ -482,6 +566,27 @@ func (e *Engine) schedule(ctx context.Context) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// limitedSlot is when the usage limit last recorded on the pipeline ends, if
+// it is still in force and the spec has an agent stage it would stop; nil
+// otherwise.
+func (e *Engine) limitedSlot(ctx context.Context, name string, sp spec.Spec, now time.Time) (*time.Time, error) {
+	hasAgent := false
+	for _, stg := range sp.Stages {
+		if stg.Kind() == spec.KindAgent {
+			hasAgent = true
+			break
+		}
+	}
+	if !hasAgent {
+		return nil, nil
+	}
+	until, err := e.Store.PipelineLimitedUntil(ctx, name)
+	if err != nil || until == nil || !until.After(now) {
+		return nil, err
+	}
+	return until, nil
 }
 
 // NextDue is the due time after a run fired at now: now+interval without

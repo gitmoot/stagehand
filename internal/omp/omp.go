@@ -14,6 +14,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -112,6 +114,11 @@ type Stream struct {
 	agentEnds    int
 	lastTerminal bool
 	unreadable   error
+
+	// limit is the provider's requested wait when firstErr is a usage
+	// limit (a 429 that says how long to wait); limited reports one.
+	limit   time.Duration
+	limited bool
 }
 
 // Feed reads one line of omp's stdout. Lines that are not JSON or not one of
@@ -147,6 +154,7 @@ func (s *Stream) Feed(line []byte) {
 		if err := assistantError(m); err != nil {
 			if s.firstErr == nil {
 				s.firstErr = err
+				s.limit, s.limited = usageLimit(m.ErrorMessage, retryAfterMsRe)
 			}
 			s.turnFailed = true
 		} else if !s.gaveUp && carriesContent(parts) {
@@ -154,6 +162,7 @@ func (s *Stream) Feed(line []byte) {
 			// (omp retried or fell back to another model).
 			s.turnFailed = false
 			s.firstErr = nil
+			s.limit, s.limited = 0, false
 		}
 		text := textOf(parts)
 		if strings.TrimSpace(text) != "" {
@@ -174,6 +183,7 @@ func (s *Stream) Feed(line []byte) {
 					detail = "no finalError reported"
 				}
 				s.firstErr = fmt.Errorf("omp gave up retrying: %s", detail)
+				s.limit, s.limited = usageLimit(ev.FinalError, providerWaitRe)
 			}
 		}
 	case "agent_end":
@@ -191,6 +201,18 @@ func (s *Stream) Tokens() (input, output int64) { return s.inputTokens, s.output
 
 // Messages is the number of assistant messages seen.
 func (s *Stream) Messages() int { return s.messages }
+
+// UsageLimit reports whether the run failed on a provider usage limit, and
+// how long the provider asked to wait: the failure Result returns is a 429
+// (or rate_limit) error that named a wait omp would not sit out. omp itself
+// waits out short ones within the attempt; a 429 without a wait is an
+// ordinary failure.
+func (s *Stream) UsageLimit() (retryAfter time.Duration, ok bool) {
+	if s.unreadable != nil || !s.turnFailed || !s.limited {
+		return 0, false
+	}
+	return s.limit, true
+}
 
 // Result returns the final answer, or why the run did not produce one.
 func (s *Stream) Result() (string, error) {
@@ -257,6 +279,35 @@ func assistantError(m *message) error {
 		detail = "no errorMessage reported"
 	}
 	return fmt.Errorf("omp turn failed (stopReason %s): %s", m.StopReason, detail)
+}
+
+var (
+	// retryAfterMsRe is how omp ends a failed turn's errorMessage when the
+	// provider sent a retry-after.
+	retryAfterMsRe = regexp.MustCompile(`retry-after-ms=(\d+)`)
+	// providerWaitRe is omp's auto_retry_end finalError when the requested
+	// wait exceeds its retry.maxDelayMs.
+	providerWaitRe = regexp.MustCompile(`Provider requested (\d+)ms wait`)
+	// rateLimitRe marks the error as a usage limit: HTTP 429 or the
+	// provider's rate_limit error type.
+	rateLimitRe = regexp.MustCompile(`\b429\b|rate_limit`)
+)
+
+// usageLimit reads the wait from an omp error text that matches wait and is
+// a 429 or rate_limit error. The wait itself is not counted as the status.
+func usageLimit(text string, wait *regexp.Regexp) (time.Duration, bool) {
+	m := wait.FindStringSubmatchIndex(text)
+	if m == nil {
+		return 0, false
+	}
+	if !rateLimitRe.MatchString(text[:m[0]] + " " + text[m[1]:]) {
+		return 0, false
+	}
+	ms, err := strconv.ParseInt(text[m[2]:m[3]], 10, 64)
+	if err != nil || ms > math.MaxInt64/int64(time.Millisecond) {
+		return 0, false
+	}
+	return time.Duration(ms) * time.Millisecond, true
 }
 
 // ExtractJSON returns the JSON document in an agent's final answer: either
