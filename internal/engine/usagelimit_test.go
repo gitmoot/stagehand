@@ -323,3 +323,19 @@ func TestCancelDuringUsageLimitWait(t *testing.T) {
 		t.Errorf("r ran %d times", n)
 	}
 }
+
+// A usage limit never hides a stage that needs a person: when another stage
+// of the same run blocked, the run ends blocked (and resumable), not skipped.
+func TestBlockedStageWinsOverAUsageLimit(t *testing.T) {
+	h := newLimitHarness(t, map[string][]string{"r": {"limit-long"}, "b": {"blocked"}})
+	h.add("name: p\nstages:\n"+agentStage("r", "")+"  - {id: b, cmd: x}\n", false)
+	id := h.start("p")
+	d := h.runToEnd(id)
+	if d.State != store.RunBlocked {
+		t.Fatalf("run %s (%s); want blocked: the blocked stage needs a person", d.State, d.HaltReason)
+	}
+	assertStates(t, d, map[string]string{"r": "skipped", "b": "blocked"})
+	if err := h.eng.Resume(context.Background(), id, "b"); err != nil {
+		t.Errorf("the blocked run is not resumable: %v", err)
+	}
+}

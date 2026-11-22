@@ -200,20 +200,26 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 	}
 	final := store.RunBlocked
 	var haltStage, haltReason string
-	// The stage a usage limit skipped (the latest limit, if several).
+	// The stage a usage limit skipped (the latest limit, if several). The
+	// run ends skipped only if nothing else needs attention: a failed or
+	// blocked stage keeps the run failed or blocked, and resumable.
 	var limitStage string
 	var limitUntil time.Time
+	needsAttention := false
 	for _, st := range stages {
 		switch st.State {
 		case store.StageFailed, store.StageCancelled:
 			final = store.RunFailed
+			needsAttention = true
+		case store.StageBlocked:
+			needsAttention = true
 		case store.StageSkipped:
 			if st.LimitedUntil != nil && (limitStage == "" || st.LimitedUntil.After(limitUntil)) {
 				limitStage, limitUntil = st.StageID, *st.LimitedUntil
 			}
 		}
 	}
-	if final != store.RunFailed && limitStage != "" {
+	if !needsAttention && limitStage != "" {
 		reason := store.UsageLimitReason(limitUntil)
 		for i := range stages {
 			if stages[i].State == store.StagePending {
