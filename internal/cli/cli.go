@@ -583,15 +583,17 @@ func (a *app) resume(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("run id %q is not a number", pos[0])
 	}
+	// Read before resuming: once the resume commits, only the receipt is
+	// left to print, and nothing may fail it.
+	r, err := a.store.GetRun(ctx, id)
+	if err != nil {
+		return err
+	}
 	if err := a.engine.Resume(ctx, id, *from); err != nil {
 		return err
 	}
 	fmt.Fprintf(a.stderr, "run #%d resumed\n", id)
 	if *queue {
-		r, err := a.store.GetRun(ctx, id)
-		if err != nil {
-			return err
-		}
 		return a.reportQueued(id, r.Pipeline, a.executor(), *asJSON)
 	}
 	return a.finish(ctx, id, *wait, *asJSON)
