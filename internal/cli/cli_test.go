@@ -214,3 +214,49 @@ func TestQueueNeverExecutesHere(t *testing.T) {
 		t.Error("--queue with --wait accepted")
 	}
 }
+
+// --queue reads who holds the lock without taking it, so it can never keep
+// serve or tick from starting (#38). Taking the lock always rewrites the
+// lock file; a stale holder line from a serve that died must survive.
+func TestQueueProbeNeverTakesTheLock(t *testing.T) {
+	home := t.TempDir()
+	spec := filepath.Join(t.TempDir(), "p.yaml")
+	os.WriteFile(spec, []byte("name: p\nstages:\n  - {id: a, cmd: 'true'}\n"), 0o600)
+	if code, _, errs := runCLI(home, "add", spec, "--enable"); code != 0 {
+		t.Fatal(errs)
+	}
+	lockPath := filepath.Join(home, "stagehand.lock")
+	stale := "2147483646 serve\n"
+	os.WriteFile(lockPath, []byte(stale), 0o600)
+	code, out, errs := runCLI(home, "run", "p", "--queue", "--json")
+	var q struct{ Executor string }
+	if code != 0 || json.Unmarshal([]byte(out), &q) != nil || q.Executor != "none" {
+		t.Fatalf("exit %d, stdout %q, stderr %q; want executor none (the recorded serve is dead)", code, out, errs)
+	}
+	if raw, _ := os.ReadFile(lockPath); string(raw) != stale {
+		t.Errorf("lock file now %q: --queue took the lock", raw)
+	}
+}
+
+// An unreadable lock state is reported as unknown, not as "no serve"; the
+// run is still accepted.
+func TestQueueWithUnreadableLockSaysUnknown(t *testing.T) {
+	home := t.TempDir()
+	spec := filepath.Join(t.TempDir(), "p.yaml")
+	os.WriteFile(spec, []byte("name: p\nstages:\n  - {id: a, cmd: 'true'}\n"), 0o600)
+	if code, _, errs := runCLI(home, "add", spec, "--enable"); code != 0 {
+		t.Fatal(errs)
+	}
+	os.Mkdir(filepath.Join(home, "stagehand.lock"), 0o700)
+	code, out, errs := runCLI(home, "run", "p", "--queue", "--json")
+	var q struct {
+		ID       int64
+		Executor string
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &q) != nil || q.ID == 0 || q.Executor != "unknown" {
+		t.Fatalf("exit %d, stdout %q, stderr %q; want an accepted run with executor unknown", code, out, errs)
+	}
+	if strings.Contains(errs, "no stagehand serve is running") {
+		t.Errorf("stderr %q claims serve is known to be absent", errs)
+	}
+}
