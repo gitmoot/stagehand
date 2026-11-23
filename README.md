@@ -191,7 +191,9 @@ Unit files and an example config are in [`deploy/`](deploy/).
   - A timeout or cancel kills the whole group.
   - The exit code decides the result.
   - To stop the run without failing it, a stage can write
-    `{"decision":"blocked","summary":"…","needs":["…"]}` to `$STAGEHAND_RESULT`.
+    `{"decision":"blocked","summary":"…","needs":["…"]}` to `$STAGEHAND_RESULT`. The file takes
+    only `decision` (`succeeded`, `blocked` or `failed`), `summary` and `needs`; any other key fails
+    the stage.
 - **What a shell stage sees:**
   - `PATH` from the runner (a standard system `PATH` if it has none), `HOME` and `TZ` from the
     runner only if it has them, and `LANG=C.UTF-8`;
@@ -407,9 +409,9 @@ list [--json]                            pipelines with schedule and last run
 show <name|run-id> [--json]              a pipeline, or one run with its stages
 enable <name> | disable <name>           turn the schedule on or off
 remove <name>                            delete a pipeline (its runs stay)
-run <name> [--wait] [--json]             start a run
+run <name> [--wait|--queue] [--json]     start a run
 runs <name> [--limit N] [--json]         newest runs of a pipeline
-resume <run-id> [--from STAGE] [--wait]  re-run a parked run from a stage
+resume <run-id> [--from STAGE] [--wait|--queue] [--json]   re-run a parked run from a stage
 cancel <run-id>                          stop a running run
 serve [--status-addr ADDR] [--trigger-addr ADDR]   run schedules, events and stages until stopped
 tick                                     one pass: fire due schedules and queued events, run them to the end
@@ -421,6 +423,13 @@ purge <run-id>                           delete a finished event run's files and
 version
 ```
 
+- **Who executes a run:** `run` and `resume` execute the run in the foreground unless `serve` is
+  running, which then executes it. With `--wait` they wait for the result either way. Without it,
+  when serve has the run they return at once; `--json` then prints
+  `{"id": N, "pipeline": "…", "state": "queued", "executor": "serve"}`.
+  `--queue` never executes here, so a caller with a short timeout cannot be held by a long run: it
+  returns at once, with `"executor": "none"` and a warning if no serve is running (the next `serve`
+  or `tick` starts it). `--queue` and `--wait` exclude each other.
 - **Home directory:** the database, logs and work files live in the home. It is `--home`, else
   `$STAGEHAND_HOME`, else `/var/lib/stagehand` for root, else `$XDG_STATE_HOME/stagehand`.
 - **One executor per home:** only one process runs stages for a home at a time, enforced by a
