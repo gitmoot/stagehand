@@ -211,8 +211,10 @@ Unit files and an example config are in [`deploy/`](deploy/).
 
   A resumed stage gets a fresh `retry` budget.
 - **Usage limits:** when omp ends an agent stage on a provider usage limit that states how long
-  to wait (omp itself sits out waits up to its `retry.maxDelayMs`, 5 minutes by default, unless
-  its retries are off), the attempt is recorded as `limited`, not `failed`. Only the provider's own form counts: an HTTP `429` whose
+  to wait, the attempt is recorded as `limited`, not `failed`. stagehand only classifies the
+  error omp finally reports; omp's own retry settings (`retry.maxDelayMs`, 5 minutes by default,
+  its retry count, `retry.waitForUsageReset`) decide which waits it sits out itself and when it
+  gives up and reports one. Only the provider's own form counts: an HTTP `429` whose
   JSON body is a `rate_limit_error`, followed by the `retry-after-ms` that omp appends from the
   response's retry headers. A 429 without a stated wait (omp may then guess a 30-minute backoff),
   an overload, or any other error stays an ordinary failure.

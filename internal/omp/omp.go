@@ -352,14 +352,10 @@ func providerLimit(text string) (time.Duration, bool) {
 	if !ok {
 		return 0, false
 	}
-	// omp writes integral milliseconds; accept exactly that.
-	for _, c := range n {
-		if c < '0' || c > '9' {
-			return 0, false
-		}
-	}
-	ms, err := strconv.ParseInt(n, 10, 64)
-	if err != nil || ms <= 0 || ms > math.MaxInt64/int64(time.Millisecond) {
+	// omp writes integral milliseconds; ParseUint takes exactly base-10
+	// digits (no sign, underscore, point or exponent).
+	ms, err := strconv.ParseUint(n, 10, 64)
+	if err != nil || ms == 0 || ms > uint64(math.MaxInt64/int64(time.Millisecond)) {
 		return 0, false
 	}
 	return time.Duration(ms) * time.Millisecond, true
