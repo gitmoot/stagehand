@@ -561,7 +561,7 @@ func (a *app) run(ctx context.Context, args []string) error {
 	}
 	fmt.Fprintf(a.stderr, "run #%d created\n", id)
 	if *queue {
-		return a.reportQueued(id, pos[0], false, *asJSON)
+		return a.reportQueued(id, pos[0], *asJSON)
 	}
 	return a.finish(ctx, id, *wait, *asJSON)
 }
@@ -589,7 +589,7 @@ func (a *app) resume(ctx context.Context, args []string) error {
 	}
 	fmt.Fprintf(a.stderr, "run #%d resumed\n", id)
 	if *queue {
-		return a.reportQueued(id, pipeline, false, *asJSON)
+		return a.reportQueued(id, pipeline, *asJSON)
 	}
 	return a.finish(ctx, id, *wait, *asJSON)
 }
@@ -641,7 +641,11 @@ func (a *app) finish(ctx context.Context, id int64, wait, asJSON bool) error {
 	if !executed && err == nil && !wait {
 		// serve executes it, unless another process already settled it.
 		if r, gerr := a.store.GetRun(ctx, id); gerr == nil && r.State == store.RunRunning {
-			return a.reportQueued(id, r.Pipeline, true, asJSON)
+			if !asJSON {
+				fmt.Fprintf(a.stdout, "run #%d queued; the running stagehand serve executes it (stagehand show %d)\n", id, id)
+				return nil
+			}
+			return a.reportQueued(id, r.Pipeline, true)
 		}
 	}
 	d, derr := a.engine.Run(context.WithoutCancel(ctx), id)
@@ -688,18 +692,13 @@ type queuedRun struct {
 	State    string `json:"state"` // always "queued"
 }
 
-// reportQueued prints a run left to another process. toServe is set only
-// when this command found serve holding the lock (and so handed it over).
-// The run is already committed: printing is all that is left.
-func (a *app) reportQueued(id int64, pipeline string, toServe, asJSON bool) error {
+// reportQueued prints a run left to another process. The run is already
+// committed: printing is all that is left.
+func (a *app) reportQueued(id int64, pipeline string, asJSON bool) error {
 	if asJSON {
 		return a.printJSON(queuedRun{ID: id, Pipeline: pipeline, State: "queued"})
 	}
-	if toServe {
-		fmt.Fprintf(a.stdout, "run #%d queued; the running stagehand serve executes it (stagehand show %d)\n", id, id)
-	} else {
-		fmt.Fprintf(a.stdout, "run #%d queued; `stagehand serve` or `stagehand tick` starts it (stagehand show %d)\n", id, id)
-	}
+	fmt.Fprintf(a.stdout, "run #%d queued; `stagehand serve` or `stagehand tick` starts it (stagehand show %d)\n", id, id)
 	return nil
 }
 

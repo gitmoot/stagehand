@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -161,11 +162,12 @@ func TestRunAndResumeQueuedPrintJSON(t *testing.T) {
 	for _, c := range []struct {
 		args     []string
 		pipeline string
-	}{{[]string{"run", "q", "--json"}, "q"}, {[]string{"resume", "1", "--json"}, "p"}} {
+		id       float64 // run 1 is p's failed run; the queued run of q is run 2
+	}{{[]string{"run", "q", "--json"}, "q", 2}, {[]string{"resume", "1", "--json"}, "p", 1}} {
 		args := c.args
 		code, out, errs := runCLI(home, args...)
 		var q map[string]any
-		if code != 0 || json.Unmarshal([]byte(out), &q) != nil || len(q) != 3 || q["id"] == nil || q["pipeline"] != c.pipeline || q["state"] != "queued" {
+		if code != 0 || json.Unmarshal([]byte(out), &q) != nil || len(q) != 3 || q["id"] != c.id || q["pipeline"] != c.pipeline || q["state"] != "queued" {
 			t.Errorf("%v: exit %d, stdout %q (stderr %q); want exactly {id, pipeline, state: queued}", args, code, out, errs)
 		}
 	}
@@ -214,6 +216,9 @@ func TestQueueNeverTouchesTheLock(t *testing.T) {
 	for name, setup := range map[string]func(path string){
 		"stale holder line": func(path string) { os.WriteFile(path, []byte("2147483646 serve\n"), 0o600) },
 		"directory":         func(path string) { os.Mkdir(path, 0o700) },
+		// Opening a FIFO blocks until a writer appears: a --queue that so much
+		// as opened the lock file would hang here.
+		"fifo": func(path string) { syscall.Mkfifo(path, 0o600) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			home := t.TempDir()
@@ -225,14 +230,35 @@ func TestQueueNeverTouchesTheLock(t *testing.T) {
 			lockPath := filepath.Join(home, "stagehand.lock")
 			setup(lockPath)
 			before, _ := os.Lstat(lockPath)
-			beforeRaw, _ := os.ReadFile(lockPath)
-			code, out, errs := runCLI(home, "run", "p", "--queue", "--json")
+			var beforeRaw []byte
+			if before.Mode().IsRegular() {
+				beforeRaw, _ = os.ReadFile(lockPath)
+			}
+			type result struct {
+				code      int
+				out, errs string
+			}
+			done := make(chan result, 1)
+			go func() {
+				code, out, errs := runCLI(home, "run", "p", "--queue", "--json")
+				done <- result{code, out, errs}
+			}()
+			var r result
+			select {
+			case r = <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("--queue blocked: it opened the lock file")
+			}
+			code, out, errs := r.code, r.out, r.errs
 			var q struct{ ID int64 }
 			if code != 0 || json.Unmarshal([]byte(out), &q) != nil || q.ID == 0 {
 				t.Fatalf("exit %d, stdout %q, stderr %q; want an accepted run", code, out, errs)
 			}
 			after, _ := os.Lstat(lockPath)
-			afterRaw, _ := os.ReadFile(lockPath)
+			var afterRaw []byte
+			if after.Mode().IsRegular() {
+				afterRaw, _ = os.ReadFile(lockPath)
+			}
 			if after.Mode() != before.Mode() || string(afterRaw) != string(beforeRaw) {
 				t.Errorf("lock path changed: --queue took the lock")
 			}
