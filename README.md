@@ -208,9 +208,9 @@ Unit files and an example config are in [`deploy/`](deploy/).
   - every stage that hasn't succeeded.
 
   A resumed stage gets a fresh `retry` budget.
-- **Usage limits:** when an agent stage's model call is refused with a provider usage limit
-  that states how long to wait, longer than omp waits out itself (5 minutes), the attempt is
-  recorded as `limited`, not `failed`. Only the provider's own form counts: an HTTP `429` whose
+- **Usage limits:** when omp ends an agent stage on a provider usage limit that states how long
+  to wait (omp itself sits out waits up to its `retry.maxDelayMs`, 5 minutes by default, unless
+  its retries are off), the attempt is recorded as `limited`, not `failed`. Only the provider's own form counts: an HTTP `429` whose
   JSON body is a `rate_limit_error`, followed by the `retry-after-ms` that omp appends from the
   response's retry headers. A 429 without a stated wait (omp may then guess a 30-minute backoff),
   an overload, or any other error stays an ordinary failure.

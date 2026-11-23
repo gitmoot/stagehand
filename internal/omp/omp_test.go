@@ -149,7 +149,11 @@ func TestUsageLimit(t *testing.T) {
 		{"run 2718: both", []string{failedTurn(limitTurn), retryStart, gaveUp(limitFinal), agentEnd}, 12769 * time.Second},
 		{"gave up with the original error as finalError", []string{failedTurn(limitTurn), retryStart, gaveUp(limitTurn), agentEnd}, 12769 * time.Second},
 		{"unwrapped SDK message", []string{failedTurn(`429 {"type":"error","error":{"type":"rate_limit_error","message":"slow down"}} retry-after-ms=600000`), agentEnd}, 10 * time.Minute},
-		{"fractional wait rounds up", []string{failedTurn(limit429 + ` retry-after-ms=1500.5`), agentEnd}, 1501 * time.Millisecond},
+		// omp writes integral milliseconds; any other number form is not its wait.
+		{"fractional wait", []string{failedTurn(limit429 + ` retry-after-ms=1500.5`), agentEnd}, 0},
+		{"underscored wait", []string{failedTurn(limit429 + ` retry-after-ms=900_000`), agentEnd}, 0},
+		{"signed wait", []string{failedTurn(limit429 + ` retry-after-ms=+900000`), agentEnd}, 0},
+		{"exponent wait", []string{failedTurn(limit429 + ` retry-after-ms=9e5`), agentEnd}, 0},
 		{"recorded HTTP 429", []string{failedTurnStatus(429, limitTurn), agentEnd}, 12769 * time.Second},
 		// Not a provider 429.
 		{"503 mentioning 429 is no limit", []string{failedTurn(overloaded503), agentEnd}, 0},
