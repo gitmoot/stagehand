@@ -423,26 +423,28 @@ purge <run-id>                           delete a finished event run's files and
 version
 ```
 
-- **Who executes a run:** `run` and `resume` execute the run in the foreground unless `serve` is
-  running, which then executes it. With `--wait` they wait for the result either way. Without it,
-  when serve has the run they return at once; `--json` then prints
-  `{"id": N, "pipeline": "…", "state": "queued", "executor": "serve"}`.
-  `--queue` never executes here, so a caller with a short timeout cannot be held by a long run: it
-  returns at once, with `"executor": "none"` and a warning if no serve is running (the next `serve`
-  or `tick` starts it). `--queue` and `--wait` exclude each other.
 - **Home directory:** the database, logs and work files live in the home. It is `--home`, else
   `$STAGEHAND_HOME`, else `/var/lib/stagehand` for root, else `$XDG_STATE_HOME/stagehand`.
 - **One executor per home:** only one process runs stages for a home at a time, enforced by a
-  lock on `stagehand.lock`. The lock file records whether its holder is `serve` or a one-off
-  command.
-  - When `serve` holds it, `run`, `resume` and `cancel` only record the request, and `serve`
-    carries it out. With `--wait`, the command waits for the result and takes over if `serve`
+  lock on `stagehand.lock`. While held, the lock file names its holder (`serve` or a one-off
+  command). Who runs a `run` or `resume`:
+  - **`--queue`:** never runs anything here; the run is recorded and the command returns at
+    once, exit 0, so a caller with a short timeout cannot be held by a long run. It reads the
+    lock file without taking the lock (so it never delays serve or tick), and says who starts
+    the run: with `--json`, `{"id": N, "pipeline": "…", "state": "queued", "executor": "…"}`,
+    where `executor` is `serve`, `none` (the next `serve` or `tick` starts it, with a warning) or
+    `unknown` (the lock file could not be read). `--queue` and `--wait` exclude each other.
+  - **`serve` holds the lock:** `run`, `resume` and `cancel` record the request and `serve`
+    carries it out. Without `--wait` they return at once, exit 0 (`--json`: the same object,
+    `"executor": "serve"`). With `--wait` they wait for the result, and take over if `serve`
     goes away.
-  - When another one-off command holds it, `run` and `resume` wait for the lock and then run
-    their own stages. They are never left queued with nobody to run them.
-  - When nobody holds it, the command runs the stages itself and returns when the run ends.
-- **Exit status:** `run` and `resume` exit non-zero unless the run succeeded: 75 when a usage
-  limit skipped it, 130 when interrupted, 1 otherwise.
+  - **Another one-off command holds it:** `run` and `resume` wait for the lock, then run their
+    own stages. They are never left queued with nobody to run them.
+  - **Nobody holds it:** the command runs the stages itself and returns when the run ends.
+- **Exit status:** whenever `run` or `resume` reports a finished run (it ran here, it waited,
+  or another process settled it first), it prints the run and exits non-zero unless the run
+  succeeded: 75 when a usage limit skipped it, 130 when interrupted, 1 otherwise. A queued
+  run (above) exits 0.
 
 ### Status for dashboards
 

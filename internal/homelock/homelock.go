@@ -85,3 +85,31 @@ func (l *Lock) Release() error {
 	l.f = nil
 	return err
 }
+
+// Holder reports who holds the lock at path, without taking it: the lock
+// file names the holder only while it is held (Release empties it), and a
+// holder that died without releasing is ignored. nil means nobody holds it.
+// It never contends for the lock, so it cannot delay an executor starting.
+func Holder(path string) (*HeldError, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if st, err := f.Stat(); err != nil {
+		return nil, err
+	} else if !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", path)
+	}
+	he := readHolder(f)
+	if he.PID <= 0 {
+		return nil, nil
+	}
+	if err := syscall.Kill(he.PID, 0); err != nil && !errors.Is(err, syscall.EPERM) {
+		return nil, nil // the recorded holder is gone
+	}
+	return he, nil
+}

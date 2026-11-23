@@ -561,7 +561,7 @@ func (a *app) run(ctx context.Context, args []string) error {
 	}
 	fmt.Fprintf(a.stderr, "run #%d created\n", id)
 	if *queue {
-		return a.reportQueued(ctx, id, a.serveRunning(), *asJSON)
+		return a.reportQueued(id, pos[0], a.executor(), *asJSON)
 	}
 	return a.finish(ctx, id, *wait, *asJSON)
 }
@@ -588,7 +588,11 @@ func (a *app) resume(ctx context.Context, args []string) error {
 	}
 	fmt.Fprintf(a.stderr, "run #%d resumed\n", id)
 	if *queue {
-		return a.reportQueued(ctx, id, a.serveRunning(), *asJSON)
+		r, err := a.store.GetRun(ctx, id)
+		if err != nil {
+			return err
+		}
+		return a.reportQueued(id, r.Pipeline, a.executor(), *asJSON)
 	}
 	return a.finish(ctx, id, *wait, *asJSON)
 }
@@ -640,7 +644,7 @@ func (a *app) finish(ctx context.Context, id int64, wait, asJSON bool) error {
 	if !executed && err == nil && !wait {
 		// serve executes it, unless another process already settled it.
 		if r, gerr := a.store.GetRun(ctx, id); gerr == nil && r.State == store.RunRunning {
-			return a.reportQueued(ctx, id, true, asJSON)
+			return a.reportQueued(id, r.Pipeline, executorServe, asJSON)
 		}
 	}
 	d, derr := a.engine.Run(context.WithoutCancel(ctx), id)
@@ -683,28 +687,30 @@ type queuedRun struct {
 	ID       int64  `json:"id"`
 	Pipeline string `json:"pipeline"`
 	State    string `json:"state"` // always "queued"
-	// Executor is "serve" when a running serve executes it, else "none":
-	// the next serve or tick starts it.
+	// Executor is who starts it: "serve" (a running serve), "none" (the
+	// next serve or tick), or "unknown" (the lock file could not be read).
 	Executor string `json:"executor"`
 }
 
-// reportQueued prints a run left for serve (or, with --queue and no serve,
-// for the next serve or tick).
-func (a *app) reportQueued(ctx context.Context, id int64, serve bool, asJSON bool) error {
-	r, err := a.store.GetRun(ctx, id)
-	if err != nil {
-		return err
-	}
-	q := queuedRun{ID: id, Pipeline: r.Pipeline, State: "queued", Executor: "none"}
-	if serve {
-		q.Executor = "serve"
-	} else {
+const (
+	executorServe   = "serve"
+	executorNone    = "none"
+	executorUnknown = "unknown"
+)
+
+// reportQueued prints a run left for serve, or (--queue) for whoever runs
+// next. The run is already committed: printing is all that is left.
+func (a *app) reportQueued(id int64, pipeline, executor string, asJSON bool) error {
+	switch executor {
+	case executorNone:
 		fmt.Fprintf(a.stderr, "no stagehand serve is running: run #%d starts when `stagehand serve` or `stagehand tick` runs\n", id)
+	case executorUnknown:
+		fmt.Fprintf(a.stderr, "could not tell whether stagehand serve is running: run #%d is queued, and starts when serve or tick runs\n", id)
 	}
 	if asJSON {
-		return a.printJSON(q)
+		return a.printJSON(queuedRun{ID: id, Pipeline: pipeline, State: "queued", Executor: executor})
 	}
-	if serve {
+	if executor == executorServe {
 		fmt.Fprintf(a.stdout, "run #%d queued; the running stagehand serve executes it (stagehand show %d)\n", id, id)
 	} else {
 		fmt.Fprintf(a.stdout, "run #%d queued (stagehand show %d)\n", id, id)
@@ -712,16 +718,20 @@ func (a *app) reportQueued(ctx context.Context, id int64, serve bool, asJSON boo
 	return nil
 }
 
-// serveRunning reports whether a stagehand serve holds the home lock. It
-// takes the lock only to test it, and releases it at once.
-func (a *app) serveRunning() bool {
-	lock, err := homelock.TryAcquire(filepath.Join(a.home, "stagehand.lock"), homelock.ModeCLI)
-	if err == nil {
-		lock.Release()
-		return false
+// executor tells who will start a queued run by reading the lock file's
+// holder. It never takes the lock, so it cannot keep serve or tick from
+// starting (#38).
+func (a *app) executor() string {
+	h, err := homelock.Holder(filepath.Join(a.home, "stagehand.lock"))
+	switch {
+	case err != nil:
+		fmt.Fprintf(a.stderr, "stagehand: lock file: %v\n", err)
+		return executorUnknown
+	case h != nil && h.Mode == homelock.ModeServe:
+		return executorServe
+	default:
+		return executorNone
 	}
-	var held *homelock.HeldError
-	return errors.As(err, &held) && held.Mode == homelock.ModeServe
 }
 
 // lockPoll is how often a waiting command retries the home lock.
