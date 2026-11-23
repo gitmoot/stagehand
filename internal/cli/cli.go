@@ -252,7 +252,7 @@ func open(ctx context.Context, home, configPath string, stderr io.Writer) (*app,
 		}}
 	}
 	eng := engine.New(st, home, executors, baseEnv(), log)
-	eng.UsageLimitWait = cfg.Agent.UsageLimitWaitDuration()
+	eng.UsageLimitWait = time.Duration(cfg.Agent.UsageLimitWait)
 	return &app{cfg: cfg, home: home, store: st, engine: eng, stderr: stderr, log: log}, nil
 }
 

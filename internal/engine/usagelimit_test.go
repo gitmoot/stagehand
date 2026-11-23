@@ -2,7 +2,9 @@ package engine
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,114 @@ import (
 	"github.com/gitmoot/stagehand/internal/spec"
 	"github.com/gitmoot/stagehand/internal/store"
 )
+
+// A limit's length is what the provider asked for, not the time left when
+// the result is folded: a 5h limit folded with a minute to go (the runner
+// was down meanwhile) still skips the run instead of waiting and retrying.
+func TestDelayedFoldOfALongLimitStillSkips(t *testing.T) {
+	h := newLimitHarness(t, nil)
+	h.add("name: p\nstages:\n"+agentStage("r", ""), false)
+	ctx := context.Background()
+	id := h.start("p")
+	stages, err := h.eng.Store.ListStages(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := stages[0]
+	st.Attempts = 1
+	finished := h.now
+	st.StartedAt = &finished
+	until := finished.Add(5 * time.Hour)
+	a := store.Attempt{RunID: id, StageID: "r", Attempt: 1, LogPath: "x", StartedAt: finished}
+	if err := h.eng.Store.StartAttempt(ctx, st, a); err != nil {
+		t.Fatal(err)
+	}
+	a.State, a.FinishedAt, a.LimitedUntil = store.AttemptLimited, &finished, &until
+	if err := h.eng.Store.FinishAttempt(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	h.now = until.Add(-time.Minute)
+	d := h.runToEnd(id)
+	if d.State != store.RunSkipped || !sameTime(d.LimitedUntil, until) {
+		t.Fatalf("run %s until %v; want skipped until %v", d.State, d.LimitedUntil, until)
+	}
+	if n := h.ex.callCount("r"); n != 0 {
+		t.Errorf("r was retried %d times after a 5h limit", n)
+	}
+}
+
+// The one short wait belongs to an execution, not to the run's history: a
+// stage whose run was cancelled during a wait and then resumed waits out a
+// fresh short limit again instead of skipping the run.
+func TestResumedStageWaitsOutAFreshShortLimit(t *testing.T) {
+	h := newLimitHarness(t, map[string][]string{"r": {"limit-short", "limit-short", "ok"}})
+	h.add("name: p\nstages:\n"+agentStage("r", ""), false)
+	ctx := context.Background()
+	id := h.start("p")
+	h.untilWaiting(id, "r")
+	if err := h.eng.Cancel(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if d := h.runToEnd(id); d.State != store.RunCancelled {
+		t.Fatalf("run %s, want cancelled", d.State)
+	}
+	if err := h.eng.Resume(ctx, id, "r"); err != nil {
+		t.Fatal(err)
+	}
+	h.untilWaiting(id, "r")
+	h.now = h.now.Add(time.Minute)
+	d := h.runToEnd(id)
+	if n := len(stageOf(t, d, "r").Attempts); d.State != store.RunSucceeded || n != 3 {
+		t.Fatalf("run %s after %d attempts; want succeeded on attempt 3", d.State, n)
+	}
+}
+
+// A skipped slot and its next due time are one write. While the next due
+// time cannot be written, polls record nothing; once it can, the slot is
+// recorded exactly once.
+func TestSkippedSlotIsRecordedOnceWhenNextDueFails(t *testing.T) {
+	h := newLimitHarness(t, map[string][]string{"r": {"limit-long"}})
+	h.add("name: p\nschedule: {interval: 1h}\nstages:\n"+agentStage("r", ""), true)
+	ctx := context.Background()
+	if err := h.eng.schedule(ctx); err != nil {
+		t.Fatal(err)
+	}
+	runs, _ := h.eng.Runs(ctx, "p", 10)
+	if len(runs) != 1 {
+		t.Fatalf("%d runs after the first slot", len(runs))
+	}
+	if d := h.runToEnd(runs[0].ID); d.State != store.RunSkipped {
+		t.Fatalf("first slot %s, want skipped", d.State)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(h.eng.Home, "stagehand.db")+"?_pragma=busy_timeout(15000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER fail_next_due BEFORE UPDATE OF next_due_at ON pipelines BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	h.now = h.now.Add(time.Hour)
+	for range 2 {
+		if err := h.eng.schedule(ctx); err == nil {
+			t.Fatal("schedule hid the failed next due write")
+		}
+	}
+	if runs, _ := h.eng.Runs(ctx, "p", 10); len(runs) != 1 {
+		t.Fatalf("%d runs while the next due time could not be written; want the first only", len(runs))
+	}
+	if _, err := db.Exec(`DROP TRIGGER fail_next_due`); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := h.eng.schedule(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if runs, _ := h.eng.Runs(ctx, "p", 10); len(runs) != 2 || runs[0].State != store.RunSkipped {
+		t.Fatalf("runs %+v; want the slot recorded once, skipped", runs)
+	}
+}
 
 // newLimitHarness is a harness whose fake also runs agent stages.
 func newLimitHarness(t *testing.T, script map[string][]string) *harness {

@@ -208,12 +208,13 @@ Unit files and an example config are in [`deploy/`](deploy/).
   - every stage that hasn't succeeded.
 
   A resumed stage gets a fresh `retry` budget.
-- **Usage limits:** when an agent stage's model calls are refused with a usage limit (a `429` or
-  `rate_limit` error naming a retry-after longer than omp waits out itself, 5 minutes), the
-  attempt is recorded as `limited`, not `failed`:
-  - **Short limit** (it ends within `agent.usage_limit_wait`, default `2m`): the stage stays
-    `pending` until the limit ends, holding no agent slot, then runs once more. That retry does
-    not use the stage's `retry`, whatever `retry` says. A second limit is treated as long.
+- **Usage limits:** when an agent stage's model calls are refused with a usage limit (the
+  provider's `429` / `rate_limit_error`, naming a retry-after longer than omp waits out itself,
+  5 minutes), the attempt is recorded as `limited`, not `failed`:
+  - **Short limit** (the provider asked to wait at most `agent.usage_limit_wait`, default `2m`):
+    the stage stays `pending` until the limit ends, holding no agent slot, then runs once more.
+    That retry does not use the stage's `retry`, whatever `retry` says. A stage waits out one
+    limit per run, or per resume; a second one is treated as long.
   - **Long limit:** the stage and the stages that depend on it are `skipped`, and the run ends
     `skipped` with halt reason `usage limit until <time>`; `run parked` is not logged. A skipped
     run is not resumable: the pipeline's next slot runs as usual. Scheduled slots that come due
@@ -224,8 +225,9 @@ Unit files and an example config are in [`deploy/`](deploy/).
   - `run --wait`, `resume --wait` and `trigger --wait` exit **75** (EX_TEMPFAIL) for a skipped
     run, instead of 1, and print `run #N skipped: usage limit until <time>; the next slot runs as
     usual`.
-  - `status --json` shows `limited_until` on a pipeline while its limit lasts, and on the run,
-    stage and attempt it stopped.
+  - `status --json` shows `limited_until` on a pipeline while its limit lasts, and on its
+    `last_run` when a limit skipped it. `show <run-id> --json` shows it on the run and on the
+    stage and attempt the limit stopped.
   - The wait is a runner setting: `agent: {usage_limit_wait: 5m}` in the settings file (a Go
     duration from `0` to `30m`; `0` means the default `2m`).
 - **Spec snapshot:** each run keeps the spec it started with. Editing or replacing the pipeline

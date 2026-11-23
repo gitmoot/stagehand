@@ -115,10 +115,30 @@ type Stream struct {
 	lastTerminal bool
 	unreadable   error
 
-	// limit is the provider's requested wait when firstErr is a usage
-	// limit (a 429 that says how long to wait); limited reports one.
-	limit   time.Duration
-	limited bool
+	// last classifies the most recent failure: the one that ended the run
+	// when it failed. firstErr stays the diagnostic text.
+	last failure
+}
+
+// failure is one failed turn or one retry omp gave up on, as a usage limit
+// sees it.
+type failure struct {
+	retryEnd  bool          // an auto_retry_end, not a failed turn
+	rateLimit bool          // the provider's 429 / rate_limit_error
+	wait      time.Duration // the wait the provider asked for (hasWait)
+	hasWait   bool
+}
+
+// noteFailure records a failure as the run's latest. omp reports one
+// provider error twice, as the failed turn and as the retry it gave up on
+// right after (or before) it, and only one of them may name the wait: the
+// wait carries over between those two, never between separate requests.
+func (s *Stream) noteFailure(f failure) {
+	p := s.last
+	if f.rateLimit && !f.hasWait && p.rateLimit && p.hasWait && p.retryEnd != f.retryEnd {
+		f.wait, f.hasWait = p.wait, true
+	}
+	s.last = f
 }
 
 // Feed reads one line of omp's stdout. Lines that are not JSON or not one of
@@ -154,15 +174,15 @@ func (s *Stream) Feed(line []byte) {
 		if err := assistantError(m); err != nil {
 			if s.firstErr == nil {
 				s.firstErr = err
-				s.limit, s.limited = usageLimit(m.ErrorMessage, retryAfterMsRe)
 			}
 			s.turnFailed = true
+			s.noteFailure(classify(m.ErrorMessage, retryAfterMsRe, false))
 		} else if !s.gaveUp && carriesContent(parts) {
 			// A later real answer recovers from an earlier failed turn
 			// (omp retried or fell back to another model).
 			s.turnFailed = false
 			s.firstErr = nil
-			s.limit, s.limited = 0, false
+			s.last = failure{}
 		}
 		text := textOf(parts)
 		if strings.TrimSpace(text) != "" {
@@ -183,8 +203,8 @@ func (s *Stream) Feed(line []byte) {
 					detail = "no finalError reported"
 				}
 				s.firstErr = fmt.Errorf("omp gave up retrying: %s", detail)
-				s.limit, s.limited = usageLimit(ev.FinalError, providerWaitRe)
 			}
+			s.noteFailure(classify(ev.FinalError, providerWaitRe, true))
 		}
 	case "agent_end":
 		s.agentEnds++
@@ -203,15 +223,15 @@ func (s *Stream) Tokens() (input, output int64) { return s.inputTokens, s.output
 func (s *Stream) Messages() int { return s.messages }
 
 // UsageLimit reports whether the run failed on a provider usage limit, and
-// how long the provider asked to wait: the failure Result returns is a 429
-// (or rate_limit) error that named a wait omp would not sit out. omp itself
-// waits out short ones within the attempt; a 429 without a wait is an
-// ordinary failure.
+// how long the provider asked to wait: the failure that ended the run is a
+// 429 / rate_limit_error that named a wait omp would not sit out. omp itself
+// waits out short ones within the attempt; a 429 without a wait, or a limit
+// followed by another failure, is an ordinary failure.
 func (s *Stream) UsageLimit() (retryAfter time.Duration, ok bool) {
-	if s.unreadable != nil || !s.turnFailed || !s.limited {
+	if s.unreadable != nil || !s.turnFailed || !s.last.rateLimit || !s.last.hasWait {
 		return 0, false
 	}
-	return s.limit, true
+	return s.last.wait, true
 }
 
 // Result returns the final answer, or why the run did not produce one.
@@ -288,26 +308,33 @@ var (
 	// providerWaitRe is omp's auto_retry_end finalError when the requested
 	// wait exceeds its retry.maxDelayMs.
 	providerWaitRe = regexp.MustCompile(`Provider requested (\d+)ms wait`)
-	// rateLimitRe marks the error as a usage limit: HTTP 429 or the
-	// provider's rate_limit error type.
-	rateLimitRe = regexp.MustCompile(`\b429\b|rate_limit`)
+	// statusBodyRe is the provider's HTTP status as omp writes it: the
+	// status immediately followed by the JSON error body.
+	statusBodyRe = regexp.MustCompile(`(?:^|[^0-9])([1-5][0-9][0-9]) \{`)
+	// errorTypeRe is the provider's structured error type, e.g.
+	// "type":"rate_limit_error" (quotes inside a message are escaped, so
+	// message text never matches).
+	errorTypeRe = regexp.MustCompile(`"type":\s*"([a-z_]+_error)"`)
 )
 
-// usageLimit reads the wait from an omp error text that matches wait and is
-// a 429 or rate_limit error. The wait itself is not counted as the status.
-func usageLimit(text string, wait *regexp.Regexp) (time.Duration, bool) {
-	m := wait.FindStringSubmatchIndex(text)
-	if m == nil {
-		return 0, false
+// classify reads one omp error text. It is a rate limit only by the
+// provider's own word: HTTP status 429 where omp gives a status, else the
+// structured type rate_limit_error. Message text never counts, so a 503 or
+// 529 (overloaded) is never a limit. wait finds the wait the text names.
+func classify(text string, wait *regexp.Regexp, retryEnd bool) failure {
+	f := failure{retryEnd: retryEnd}
+	if m := statusBodyRe.FindStringSubmatch(text); m != nil {
+		f.rateLimit = m[1] == "429"
+	} else if m := errorTypeRe.FindStringSubmatch(text); m != nil {
+		f.rateLimit = m[1] == "rate_limit_error"
 	}
-	if !rateLimitRe.MatchString(text[:m[0]] + " " + text[m[1]:]) {
-		return 0, false
+	if m := wait.FindStringSubmatch(text); m != nil {
+		ms, err := strconv.ParseInt(m[1], 10, 64)
+		if err == nil && ms <= math.MaxInt64/int64(time.Millisecond) {
+			f.wait, f.hasWait = time.Duration(ms)*time.Millisecond, true
+		}
 	}
-	ms, err := strconv.ParseInt(text[m[2]:m[3]], 10, 64)
-	if err != nil || ms > math.MaxInt64/int64(time.Millisecond) {
-		return 0, false
-	}
-	return time.Duration(ms) * time.Millisecond, true
+	return f
 }
 
 // ExtractJSON returns the JSON document in an agent's final answer: either

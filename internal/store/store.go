@@ -184,7 +184,9 @@ var migrations = []string{
 	// 4: provider usage limits (#33).
 	`ALTER TABLE stage_attempts ADD COLUMN limited_until TEXT;
 	ALTER TABLE run_stages ADD COLUMN limited_until TEXT;
-	ALTER TABLE runs ADD COLUMN limited_until TEXT;`,
+	ALTER TABLE run_stages ADD COLUMN limit_waits INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE runs ADD COLUMN limited_until TEXT;
+	CREATE INDEX runs_limited ON runs(pipeline, limited_until);`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -220,6 +222,20 @@ func fmtTimePtr(t *time.Time) any {
 		return nil
 	}
 	return fmtTime(*t)
+}
+
+// limitTimeLayout writes limited_until fixed-width in UTC, so the text sorts
+// as the time does (RFC3339Nano trims trailing zeros and does not). It still
+// parses as RFC 3339.
+const limitTimeLayout = "2006-01-02T15:04:05.000000000Z"
+
+func fmtLimitTime(t time.Time) string { return t.UTC().Format(limitTimeLayout) }
+
+func fmtLimitTimePtr(t *time.Time) any {
+	if t == nil || t.IsZero() {
+		return nil
+	}
+	return fmtLimitTime(*t)
 }
 
 func parseTimePtr(ns sql.NullString) (*time.Time, error) {
@@ -371,6 +387,9 @@ type RunStage struct {
 	// LimitedUntil is set while a stage waits out a usage limit (pending)
 	// and on a stage a usage limit skipped.
 	LimitedUntil *time.Time
+	// LimitWaits counts the usage limits the stage waited out since it was
+	// created or last resumed; it gets one such wait.
+	LimitWaits int
 }
 
 // Attempt is one execution of one stage.
@@ -455,11 +474,12 @@ func UsageLimitReason(until time.Time) string {
 	return "usage limit until " + until.UTC().Format(time.RFC3339)
 }
 
-// CreateSkippedRun records a run that a usage limit skips before it starts:
-// the run and every stage are skipped at once, in one transaction. It never
-// exists as running, so it never competes with the pipeline's one running
-// run.
-func (s *Store) CreateSkippedRun(ctx context.Context, r Run, stageIDs []string, until time.Time) (int64, error) {
+// CreateSkippedRun records a scheduled slot that a usage limit skips before
+// it starts, and moves the pipeline's next due time to nextDue, in one
+// transaction: the run and every stage are skipped at once, and a slot is
+// never recorded twice. It never exists as running, so it never competes
+// with the pipeline's one running run.
+func (s *Store) CreateSkippedRun(ctx context.Context, r Run, stageIDs []string, until, nextDue time.Time) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -469,7 +489,7 @@ func (s *Store) CreateSkippedRun(ctx context.Context, r Run, stageIDs []string, 
 	at := fmtTime(r.CreatedAt)
 	res, err := tx.ExecContext(ctx, `INSERT INTO runs (pipeline, trigger, spec_yaml, spec_hash, source_dir, state, halt_reason, limited_until, created_at, finished_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		r.Pipeline, r.Trigger, r.SpecYAML, r.SpecHash, r.SourceDir, RunSkipped, reason, fmtTime(until), at, at)
+		r.Pipeline, r.Trigger, r.SpecYAML, r.SpecHash, r.SourceDir, RunSkipped, reason, fmtLimitTime(until), at, at)
 	if err != nil {
 		return 0, err
 	}
@@ -482,6 +502,10 @@ func (s *Store) CreateSkippedRun(ctx context.Context, r Run, stageIDs []string, 
 			id, sid, i, StageSkipped, "not run: "+reason, at); err != nil {
 			return 0, err
 		}
+	}
+	upd, err := tx.ExecContext(ctx, `UPDATE pipelines SET next_due_at=? WHERE name=?`, fmtTime(nextDue), r.Pipeline)
+	if err := expectOne(upd, err, "pipeline "+r.Pipeline); err != nil {
+		return 0, err
 	}
 	return id, tx.Commit()
 }
@@ -562,35 +586,23 @@ func (s *Store) FinishRun(ctx context.Context, id int64, state, haltStage, haltR
 // until until, halted at haltStage.
 func (s *Store) FinishRunSkipped(ctx context.Context, id int64, haltStage string, until, at time.Time) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE runs SET state=?, halt_stage=?, halt_reason=?, limited_until=?, finished_at=? WHERE id=? AND state=?`,
-		RunSkipped, haltStage, UsageLimitReason(until), fmtTime(until), fmtTime(at), id, RunRunning)
+		RunSkipped, haltStage, UsageLimitReason(until), fmtLimitTime(until), fmtTime(at), id, RunRunning)
 	return expectOne(res, err, fmt.Sprintf("running run %d", id))
 }
 
 // PipelineLimitedUntil is the latest usage limit end recorded on any of the
-// pipeline's runs, or nil.
+// pipeline's runs, or nil. limited_until is fixed-width UTC text, so the
+// index's order is the time order.
 func (s *Store) PipelineLimitedUntil(ctx context.Context, pipeline string) (*time.Time, error) {
-	// Compared as times: RFC 3339 strings with trimmed fractions do not
-	// sort as text.
-	rows, err := s.db.QueryContext(ctx, `SELECT limited_until FROM runs WHERE pipeline=? AND limited_until IS NOT NULL`, pipeline)
+	var ns sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT limited_until FROM runs WHERE pipeline=? AND limited_until IS NOT NULL ORDER BY limited_until DESC LIMIT 1`, pipeline).Scan(&ns)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var latest *time.Time
-	for rows.Next() {
-		var ns sql.NullString
-		if err := rows.Scan(&ns); err != nil {
-			return nil, err
-		}
-		t, err := parseTimePtr(ns)
-		if err != nil {
-			return nil, err
-		}
-		if t != nil && (latest == nil || t.After(*latest)) {
-			latest = t
-		}
-	}
-	return latest, rows.Err()
+	return parseTimePtr(ns)
 }
 
 // RequestCancel flags a running run for cancellation. The executing process
@@ -635,7 +647,7 @@ func (s *Store) ResumeRun(ctx context.Context, id int64, reset []string) error {
 		return err
 	}
 	for _, sid := range reset {
-		if _, err := tx.ExecContext(ctx, `UPDATE run_stages SET state=?, retry_base=attempts, summary='', needs_json='', finished_at=NULL, limited_until=NULL WHERE run_id=? AND stage_id=?`,
+		if _, err := tx.ExecContext(ctx, `UPDATE run_stages SET state=?, retry_base=attempts, limit_waits=0, summary='', needs_json='', finished_at=NULL, limited_until=NULL WHERE run_id=? AND stage_id=?`,
 			StagePending, id, sid); err != nil {
 			return err
 		}
@@ -645,7 +657,7 @@ func (s *Store) ResumeRun(ctx context.Context, id int64, reset []string) error {
 
 // ---- stages ----
 
-const stageCols = `run_id, stage_id, position, state, attempts, retry_base, summary, needs_json, started_at, finished_at, limited_until`
+const stageCols = `run_id, stage_id, position, state, attempts, retry_base, limit_waits, summary, needs_json, started_at, finished_at, limited_until`
 
 // ListStages returns a run's stages in spec order.
 func (s *Store) ListStages(ctx context.Context, runID int64) ([]RunStage, error) {
@@ -658,7 +670,7 @@ func (s *Store) ListStages(ctx context.Context, runID int64) ([]RunStage, error)
 	for rows.Next() {
 		var st RunStage
 		var started, finished, limited sql.NullString
-		if err := rows.Scan(&st.RunID, &st.StageID, &st.Position, &st.State, &st.Attempts, &st.RetryBase, &st.Summary, &st.NeedsJSON, &started, &finished, &limited); err != nil {
+		if err := rows.Scan(&st.RunID, &st.StageID, &st.Position, &st.State, &st.Attempts, &st.RetryBase, &st.LimitWaits, &st.Summary, &st.NeedsJSON, &started, &finished, &limited); err != nil {
 			return nil, err
 		}
 		if st.StartedAt, err = parseTimePtr(started); err != nil {
@@ -675,11 +687,11 @@ func (s *Store) ListStages(ctx context.Context, runID int64) ([]RunStage, error)
 	return out, rows.Err()
 }
 
-// UpdateStage writes a stage row, including its retry base (a usage-limit
-// retry moves it) and LimitedUntil.
+// UpdateStage writes a stage row, including its retry base and limit waits
+// (a usage-limit wait moves both) and LimitedUntil.
 func (s *Store) UpdateStage(ctx context.Context, st RunStage) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE run_stages SET state=?, attempts=?, retry_base=?, summary=?, needs_json=?, started_at=?, finished_at=?, limited_until=? WHERE run_id=? AND stage_id=?`,
-		st.State, st.Attempts, st.RetryBase, st.Summary, st.NeedsJSON, fmtTimePtr(st.StartedAt), fmtTimePtr(st.FinishedAt), fmtTimePtr(st.LimitedUntil), st.RunID, st.StageID)
+	res, err := s.db.ExecContext(ctx, `UPDATE run_stages SET state=?, attempts=?, retry_base=?, limit_waits=?, summary=?, needs_json=?, started_at=?, finished_at=?, limited_until=? WHERE run_id=? AND stage_id=?`,
+		st.State, st.Attempts, st.RetryBase, st.LimitWaits, st.Summary, st.NeedsJSON, fmtTimePtr(st.StartedAt), fmtTimePtr(st.FinishedAt), fmtLimitTimePtr(st.LimitedUntil), st.RunID, st.StageID)
 	return expectOne(res, err, fmt.Sprintf("stage %d/%s", st.RunID, st.StageID))
 }
 
@@ -815,7 +827,7 @@ func (s *Store) FinishAttempt(ctx context.Context, a Attempt) error {
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE stage_attempts SET state=?, exit_code=?, cost=?, input_tokens=?, output_tokens=?, summary=?, needs_json=?, finished_at=?, limited_until=?
 		WHERE run_id=? AND stage_id=? AND attempt=? AND state=?`,
-		a.State, exit, a.Cost, a.InputTokens, a.OutputTokens, a.Summary, a.NeedsJSON, fmtTimePtr(a.FinishedAt), fmtTimePtr(a.LimitedUntil), a.RunID, a.StageID, a.Attempt, AttemptRunning)
+		a.State, exit, a.Cost, a.InputTokens, a.OutputTokens, a.Summary, a.NeedsJSON, fmtTimePtr(a.FinishedAt), fmtLimitTimePtr(a.LimitedUntil), a.RunID, a.StageID, a.Attempt, AttemptRunning)
 	return expectOne(res, err, fmt.Sprintf("running attempt %d/%s/%d", a.RunID, a.StageID, a.Attempt))
 }
 

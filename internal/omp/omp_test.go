@@ -114,6 +114,8 @@ const (
 	limit429   = `Anthropic stream error (api_error): 429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your rate limit."}}`
 	limitTurn  = limit429 + ` retry-after-ms=12769000`
 	limitFinal = `Provider requested 12769000ms wait, exceeds retry.maxDelayMs (300000ms). Original error: ` + limit429
+	// A 503 whose message happens to mention 429 and rate limits.
+	overloaded503 = `Anthropic stream error (api_error): 503 {"type":"error","error":{"type":"overloaded_error","message":"upstream shard 429 unavailable, rate_limit hit"}} retry-after-ms=60000`
 )
 
 func failedTurn(errorMessage string) string {
@@ -136,7 +138,15 @@ func TestUsageLimit(t *testing.T) {
 		{"failed turn names retry-after-ms", []string{failedTurn(limitTurn), agentEnd}, 12769 * time.Second},
 		{"omp gave up on the provider's wait", []string{retryStart, gaveUp(limitFinal), agentEnd}, 12769 * time.Second},
 		{"run 2718: both", []string{failedTurn(limitTurn), retryStart, gaveUp(limitFinal), agentEnd}, 12769 * time.Second},
-		{"rate_limit without a status", []string{failedTurn(`rate_limit_error: slow down retry-after-ms=600000`), agentEnd}, 10 * time.Minute},
+		{"rate_limit_error without a status", []string{failedTurn(`{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}} retry-after-ms=600000`), agentEnd}, 10 * time.Minute},
+		{"503 mentioning 429 is no limit", []string{failedTurn(overloaded503), agentEnd}, 0},
+		{"529 with 429 { in its message is no limit", []string{failedTurn(`(api_error): 529 {"type":"error","error":{"type":"overloaded_error","message":"shard said 429 {busy}"}} retry-after-ms=60000`), agentEnd}, 0},
+		{"turn without a wait, then omp gave up on one", []string{failedTurn(limit429), retryStart,
+			gaveUp(`Provider requested 900000ms wait, exceeds retry.maxDelayMs (300000ms). Original error: ` + limit429), agentEnd}, 900 * time.Second},
+		{"limit, then a terminal 503 turn", []string{failedTurn(limitTurn), retryStart, failedTurn(overloaded503), agentEnd}, 0},
+		{"limit, then omp gave up on a 503", []string{failedTurn(limitTurn), retryStart, gaveUp(`Retry failed. Original error: ` + overloaded503), agentEnd}, 0},
+		{"gave up on the turn's limit without naming the wait", []string{failedTurn(limitTurn), retryStart, gaveUp(`Retry failed. Original error: ` + limit429), agentEnd}, 12769 * time.Second},
+		{"wait never carries over to a separate request", []string{failedTurn(limitTurn), failedTurn(limit429), agentEnd}, 0},
 		{"429 without retry-after", []string{failedTurn(limit429), agentEnd}, 0},
 		{"gave up on a 429 without a wait", []string{retryStart, gaveUp(`429 rate_limit_error`), agentEnd}, 0},
 		{"retry-after on another error", []string{failedTurn(`500 api_error retry-after-ms=4290`), agentEnd}, 0},

@@ -241,12 +241,12 @@ func (e *Engine) createRun(ctx context.Context, p store.Pipeline, sp spec.Spec, 
 }
 
 // skipRun records a run that a usage limit lasting until until skips before
-// any of its stages starts.
-func (e *Engine) skipRun(ctx context.Context, p store.Pipeline, sp spec.Spec, trigger string, until time.Time) (int64, error) {
+// any of its stages starts, and sets the pipeline's next due time, at once.
+func (e *Engine) skipRun(ctx context.Context, p store.Pipeline, sp spec.Spec, trigger string, until, next time.Time) (int64, error) {
 	id, err := e.Store.CreateSkippedRun(ctx, store.Run{
 		Pipeline: p.Name, Trigger: trigger, SpecYAML: p.SpecYAML, SpecHash: p.SpecHash,
 		SourceDir: p.SourceDir, CreatedAt: e.now(),
-	}, stageIDs(sp), until)
+	}, stageIDs(sp), until, next)
 	if err == nil {
 		e.Log.Info("run skipped", "pipeline", p.Name, "run", id, "trigger", trigger, "reason", store.UsageLimitReason(until))
 	}

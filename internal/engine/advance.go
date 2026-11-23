@@ -87,7 +87,7 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 				e.Log.Info("stage will retry", "run", run.ID, "stage", st.StageID, "attempt", st.Attempts, "summary", a.Summary)
 			}
 		case store.AttemptLimited:
-			state, summary, limitedUntil = e.foldLimited(run, st, a, attempts)
+			state, summary, limitedUntil = e.foldLimited(run, st, a)
 		default: // interrupted: never retried automatically
 			state = store.StageFailed
 		}
@@ -249,19 +249,28 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 }
 
 // foldLimited decides what a usage-limited attempt does to its stage. A
-// short limit (ending within UsageLimitWait) is waited out once: the stage
+// short limit (the provider asked for at most UsageLimitWait) is waited out
+// once per execution (since the run started or was last resumed): the stage
 // stays pending until the limit ends, then retries outside its retry budget.
 // Otherwise (a long limit, a second one, or a run being cancelled) the stage
 // is skipped, which ends the run skipped. An event run's stage blocks
 // instead: the event is not delivered again, so its run must stay resumable.
-func (e *Engine) foldLimited(run store.Run, st *store.RunStage, a store.Attempt, attempts []store.Attempt) (state, summary string, until *time.Time) {
-	now := e.now()
-	end := now
+//
+// Short or long is the provider's requested wait, never the time left: a
+// fold delayed by a restart must not turn a 5h limit into a short wait.
+func (e *Engine) foldLimited(run store.Run, st *store.RunStage, a store.Attempt) (state, summary string, until *time.Time) {
+	end, requested := e.now(), time.Duration(0)
 	if a.LimitedUntil != nil {
 		end = *a.LimitedUntil
+		finished := e.now()
+		if a.FinishedAt != nil {
+			finished = *a.FinishedAt
+		}
+		requested = end.Sub(finished)
 	}
-	if !run.CancelRequested && end.Sub(now) <= e.usageLimitWait() && !limitedBefore(attempts, a) {
+	if !run.CancelRequested && requested <= e.usageLimitWait() && st.LimitWaits == 0 {
 		st.RetryBase++
+		st.LimitWaits++
 		e.Log.Info("stage waits out a usage limit", "run", run.ID, "stage", st.StageID, "attempt", a.Attempt, "until", end)
 		return store.StagePending, a.Summary, &end
 	}
@@ -270,17 +279,6 @@ func (e *Engine) foldLimited(run store.Run, st *store.RunStage, a store.Attempt,
 		return store.StageBlocked, reason + "; resume after it", nil
 	}
 	return store.StageSkipped, reason, &end
-}
-
-// limitedBefore reports whether an earlier attempt of a's stage in the run
-// hit a usage limit.
-func limitedBefore(attempts []store.Attempt, a store.Attempt) bool {
-	for _, b := range attempts {
-		if b.StageID == a.StageID && b.Attempt < a.Attempt && b.State == store.AttemptLimited {
-			return true
-		}
-	}
-	return false
 }
 
 // foldStage records a stage's new state. limitedUntil is kept only when
@@ -555,18 +553,20 @@ func (e *Engine) schedule(ctx context.Context) error {
 			errs = append(errs, err)
 			continue
 		}
+		next := NextDue(*sp.Schedule, now, e.Jitter)
 		if until != nil {
-			// A usage limit still holds: record the slot as skipped
-			// without starting anything.
-			if _, err := e.skipRun(ctx, p, sp, "schedule", *until); err != nil {
+			// A usage limit still holds: record the slot as skipped,
+			// without starting anything, and move on to the next slot in
+			// the same transaction, so a slot is never recorded twice.
+			if _, err := e.skipRun(ctx, p, sp, "schedule", *until, next); err != nil {
 				errs = append(errs, err)
-				continue
 			}
-		} else if _, err := e.createRun(ctx, p, sp, "schedule"); err != nil && !errors.Is(err, store.ErrActiveRun) {
+			continue
+		}
+		if _, err := e.createRun(ctx, p, sp, "schedule"); err != nil && !errors.Is(err, store.ErrActiveRun) {
 			errs = append(errs, err)
 			continue
 		}
-		next := NextDue(*sp.Schedule, now, e.Jitter)
 		if err := e.Store.SetNextDue(ctx, p.Name, &next); err != nil {
 			errs = append(errs, err)
 		}
