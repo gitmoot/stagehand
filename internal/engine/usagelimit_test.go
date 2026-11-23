@@ -63,7 +63,7 @@ func TestResumedStageWaitsOutAFreshShortLimit(t *testing.T) {
 	if d := h.runToEnd(id); d.State != store.RunCancelled {
 		t.Fatalf("run %s, want cancelled", d.State)
 	}
-	if err := h.eng.Resume(ctx, id, "r"); err != nil {
+	if _, err := h.eng.Resume(ctx, id, "r"); err != nil {
 		t.Fatal(err)
 	}
 	h.untilWaiting(id, "r")
@@ -209,7 +209,7 @@ func TestLongUsageLimitSkipsTheRun(t *testing.T) {
 		t.Errorf("calls %v; want r once (retry unused) and d never", h.ex.calls)
 	}
 	ctx := context.Background()
-	if err := h.eng.Resume(ctx, id, ""); !errors.Is(err, store.ErrSkippedRun) {
+	if _, err := h.eng.Resume(ctx, id, ""); !errors.Is(err, store.ErrSkippedRun) {
 		t.Errorf("engine resume of a skipped run: %v", err)
 	}
 	if err := h.eng.Store.ResumeRun(ctx, id, []string{"r"}); !errors.Is(err, store.ErrSkippedRun) {
@@ -404,7 +404,7 @@ func TestLongUsageLimitBlocksAnEventRun(t *testing.T) {
 		t.Fatalf("event run %s at %q (%s), limited_until %v; want blocked at r (%s)", r.State, r.HaltStage, r.HaltReason, r.LimitedUntil, want)
 	}
 	h.now = until.Add(time.Minute)
-	if err := h.eng.Resume(ctx, runs[0].ID, ""); err != nil {
+	if _, err := h.eng.Resume(ctx, runs[0].ID, ""); err != nil {
 		t.Fatal(err)
 	}
 	if d := h.runToEnd(runs[0].ID); d.State != store.RunSucceeded {
@@ -445,7 +445,7 @@ func TestBlockedStageWinsOverAUsageLimit(t *testing.T) {
 		t.Fatalf("run %s (%s); want blocked: the blocked stage needs a person", d.State, d.HaltReason)
 	}
 	assertStates(t, d, map[string]string{"r": "skipped", "b": "blocked"})
-	if err := h.eng.Resume(context.Background(), id, "b"); err != nil {
+	if _, err := h.eng.Resume(context.Background(), id, "b"); err != nil {
 		t.Errorf("the blocked run is not resumable: %v", err)
 	}
 }

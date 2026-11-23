@@ -164,14 +164,9 @@ func TestRunAndResumeQueuedPrintJSON(t *testing.T) {
 	}{{[]string{"run", "q", "--json"}, "q"}, {[]string{"resume", "1", "--json"}, "p"}} {
 		args := c.args
 		code, out, errs := runCLI(home, args...)
-		var q struct {
-			ID       int64  `json:"id"`
-			Pipeline string `json:"pipeline"`
-			State    string `json:"state"`
-			Executor string `json:"executor"`
-		}
-		if code != 0 || json.Unmarshal([]byte(out), &q) != nil || q.ID == 0 || q.Pipeline != c.pipeline || q.State != "queued" || q.Executor != "serve" {
-			t.Errorf("%v: exit %d, stdout %q (stderr %q); want queued JSON for serve", args, code, out, errs)
+		var q map[string]any
+		if code != 0 || json.Unmarshal([]byte(out), &q) != nil || len(q) != 3 || q["id"] == nil || q["pipeline"] != c.pipeline || q["state"] != "queued" {
+			t.Errorf("%v: exit %d, stdout %q (stderr %q); want exactly {id, pipeline, state: queued}", args, code, out, errs)
 		}
 	}
 }
@@ -190,15 +185,11 @@ func TestQueueNeverExecutesHere(t *testing.T) {
 	}
 	code, out, errs := runCLI(home, "run", "p", "--queue", "--json")
 	var q struct {
-		ID       int64  `json:"id"`
-		State    string `json:"state"`
-		Executor string `json:"executor"`
+		ID    int64  `json:"id"`
+		State string `json:"state"`
 	}
-	if code != 0 || json.Unmarshal([]byte(out), &q) != nil || q.State != "queued" || q.Executor != "none" {
-		t.Fatalf("exit %d, stdout %q; want queued JSON with executor none", code, out)
-	}
-	if !strings.Contains(errs, "no stagehand serve is running") {
-		t.Errorf("stderr %q; want a warning that nothing executes it yet", errs)
+	if code != 0 || json.Unmarshal([]byte(out), &q) != nil || q.ID == 0 || q.State != "queued" {
+		t.Fatalf("exit %d, stdout %q, stderr %q; want queued JSON", code, out, errs)
 	}
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatal("--queue executed the run")
@@ -215,48 +206,36 @@ func TestQueueNeverExecutesHere(t *testing.T) {
 	}
 }
 
-// --queue reads who holds the lock without taking it, so it can never keep
-// serve or tick from starting (#38). Taking the lock always rewrites the
-// lock file; a stale holder line from a serve that died must survive.
-func TestQueueProbeNeverTakesTheLock(t *testing.T) {
-	home := t.TempDir()
-	spec := filepath.Join(t.TempDir(), "p.yaml")
-	os.WriteFile(spec, []byte("name: p\nstages:\n  - {id: a, cmd: 'true'}\n"), 0o600)
-	if code, _, errs := runCLI(home, "add", spec, "--enable"); code != 0 {
-		t.Fatal(errs)
-	}
-	lockPath := filepath.Join(home, "stagehand.lock")
-	stale := "2147483646 serve\n"
-	os.WriteFile(lockPath, []byte(stale), 0o600)
-	code, out, errs := runCLI(home, "run", "p", "--queue", "--json")
-	var q struct{ Executor string }
-	if code != 0 || json.Unmarshal([]byte(out), &q) != nil || q.Executor != "none" {
-		t.Fatalf("exit %d, stdout %q, stderr %q; want executor none (the recorded serve is dead)", code, out, errs)
-	}
-	if raw, _ := os.ReadFile(lockPath); string(raw) != stale {
-		t.Errorf("lock file now %q: --queue took the lock", raw)
-	}
-}
-
-// An unreadable lock state is reported as unknown, not as "no serve"; the
-// run is still accepted.
-func TestQueueWithUnreadableLockSaysUnknown(t *testing.T) {
-	home := t.TempDir()
-	spec := filepath.Join(t.TempDir(), "p.yaml")
-	os.WriteFile(spec, []byte("name: p\nstages:\n  - {id: a, cmd: 'true'}\n"), 0o600)
-	if code, _, errs := runCLI(home, "add", spec, "--enable"); code != 0 {
-		t.Fatal(errs)
-	}
-	os.Mkdir(filepath.Join(home, "stagehand.lock"), 0o700)
-	code, out, errs := runCLI(home, "run", "p", "--queue", "--json")
-	var q struct {
-		ID       int64
-		Executor string
-	}
-	if code != 0 || json.Unmarshal([]byte(out), &q) != nil || q.ID == 0 || q.Executor != "unknown" {
-		t.Fatalf("exit %d, stdout %q, stderr %q; want an accepted run with executor unknown", code, out, errs)
-	}
-	if strings.Contains(errs, "no stagehand serve is running") {
-		t.Errorf("stderr %q claims serve is known to be absent", errs)
+// --queue never touches the home lock, so it can never keep serve or tick
+// from starting (#38), and makes no claim about who runs the run (#43).
+// Taking the lock always rewrites the lock file; whatever is there, even a
+// directory, must be left alone, and the run still accepted.
+func TestQueueNeverTouchesTheLock(t *testing.T) {
+	for name, setup := range map[string]func(path string){
+		"stale holder line": func(path string) { os.WriteFile(path, []byte("2147483646 serve\n"), 0o600) },
+		"directory":         func(path string) { os.Mkdir(path, 0o700) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			spec := filepath.Join(t.TempDir(), "p.yaml")
+			os.WriteFile(spec, []byte("name: p\nstages:\n  - {id: a, cmd: 'true'}\n"), 0o600)
+			if code, _, errs := runCLI(home, "add", spec, "--enable"); code != 0 {
+				t.Fatal(errs)
+			}
+			lockPath := filepath.Join(home, "stagehand.lock")
+			setup(lockPath)
+			before, _ := os.Lstat(lockPath)
+			beforeRaw, _ := os.ReadFile(lockPath)
+			code, out, errs := runCLI(home, "run", "p", "--queue", "--json")
+			var q struct{ ID int64 }
+			if code != 0 || json.Unmarshal([]byte(out), &q) != nil || q.ID == 0 {
+				t.Fatalf("exit %d, stdout %q, stderr %q; want an accepted run", code, out, errs)
+			}
+			after, _ := os.Lstat(lockPath)
+			afterRaw, _ := os.ReadFile(lockPath)
+			if after.Mode() != before.Mode() || string(afterRaw) != string(beforeRaw) {
+				t.Errorf("lock path changed: --queue took the lock")
+			}
+		})
 	}
 }
