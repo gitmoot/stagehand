@@ -82,7 +82,9 @@ func (e *Engine) advance(ctx context.Context, run store.Run) (bool, error) {
 			state = store.StageCancelled
 		case store.AttemptFailed:
 			state = store.StageFailed
-			if !run.CancelRequested && st.Attempts-st.RetryBase <= stg.Retry {
+			// The retry budget counts attempts since the last resume, less
+			// the ones that only waited out a usage limit.
+			if !run.CancelRequested && st.Attempts-st.RetryBase-st.LimitWaits <= stg.Retry {
 				state = store.StagePending
 				e.Log.Info("stage will retry", "run", run.ID, "stage", st.StageID, "attempt", st.Attempts, "summary", a.Summary)
 			}
@@ -269,7 +271,6 @@ func (e *Engine) foldLimited(run store.Run, st *store.RunStage, a store.Attempt)
 		requested = end.Sub(finished)
 	}
 	if !run.CancelRequested && requested <= e.usageLimitWait() && st.LimitWaits == 0 {
-		st.RetryBase++
 		st.LimitWaits++
 		e.Log.Info("stage waits out a usage limit", "run", run.ID, "stage", st.StageID, "attempt", a.Attempt, "until", end)
 		return store.StagePending, a.Summary, &end

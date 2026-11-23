@@ -120,25 +120,14 @@ type Stream struct {
 	last failure
 }
 
-// failure is one failed turn or one retry omp gave up on, as a usage limit
-// sees it.
+// failure is the latest failed turn, or the latest retry omp gave up on, as
+// a usage limit sees it. Each is judged on its own text: omp writes the wait
+// into the same text as the error it belongs to, so nothing carries over
+// from an earlier event.
 type failure struct {
-	retryEnd  bool          // an auto_retry_end, not a failed turn
 	rateLimit bool          // the provider's 429 / rate_limit_error
 	wait      time.Duration // the wait the provider asked for (hasWait)
 	hasWait   bool
-}
-
-// noteFailure records a failure as the run's latest. omp reports one
-// provider error twice, as the failed turn and as the retry it gave up on
-// right after (or before) it, and only one of them may name the wait: the
-// wait carries over between those two, never between separate requests.
-func (s *Stream) noteFailure(f failure) {
-	p := s.last
-	if f.rateLimit && !f.hasWait && p.rateLimit && p.hasWait && p.retryEnd != f.retryEnd {
-		f.wait, f.hasWait = p.wait, true
-	}
-	s.last = f
 }
 
 // Feed reads one line of omp's stdout. Lines that are not JSON or not one of
@@ -176,7 +165,7 @@ func (s *Stream) Feed(line []byte) {
 				s.firstErr = err
 			}
 			s.turnFailed = true
-			s.noteFailure(classify(m.ErrorMessage, retryAfterMsRe, false))
+			s.last = classifyTurn(m.ErrorMessage)
 		} else if !s.gaveUp && carriesContent(parts) {
 			// A later real answer recovers from an earlier failed turn
 			// (omp retried or fell back to another model).
@@ -204,7 +193,7 @@ func (s *Stream) Feed(line []byte) {
 				}
 				s.firstErr = fmt.Errorf("omp gave up retrying: %s", detail)
 			}
-			s.noteFailure(classify(ev.FinalError, providerWaitRe, true))
+			s.last = classifyRetryEnd(ev.FinalError)
 		}
 	case "agent_end":
 		s.agentEnds++
@@ -301,40 +290,87 @@ func assistantError(m *message) error {
 	return fmt.Errorf("omp turn failed (stopReason %s): %s", m.StopReason, detail)
 }
 
+// omp's error texts, as omp 18 writes them (packages/ai):
+//
+//	failed turn:  <provider error>[ retry-after-ms=N]
+//	              where the provider error is the SDK message, "<status> <JSON body>",
+//	              optionally wrapped as "Anthropic stream error[ (<type>)]: ...", and
+//	              " retry-after-ms=N" is appended at the very end only when the HTTP
+//	              response carried retry headers.
+//	gave up:      Provider requested Nms wait, exceeds retry.maxDelayMs (Mms). Original error: <provider error>
+//	              or the original <provider error> itself,
+//	              or "Retry continuation failed locally: ... Original error: ...", a local
+//	              failure: its start is no provider status, so it is never a limit.
+//
+// Only these positions are read; message text never is.
 var (
-	// retryAfterMsRe is how omp ends a failed turn's errorMessage when the
-	// provider sent a retry-after.
-	retryAfterMsRe = regexp.MustCompile(`retry-after-ms=(\d+)`)
-	// providerWaitRe is omp's auto_retry_end finalError when the requested
-	// wait exceeds its retry.maxDelayMs.
-	providerWaitRe = regexp.MustCompile(`Provider requested (\d+)ms wait`)
-	// statusBodyRe is the provider's HTTP status as omp writes it: the
-	// status immediately followed by the JSON error body.
-	statusBodyRe = regexp.MustCompile(`(?:^|[^0-9])([1-5][0-9][0-9]) \{`)
-	// errorTypeRe is the provider's structured error type, e.g.
-	// "type":"rate_limit_error" (quotes inside a message are escaped, so
-	// message text never matches).
-	errorTypeRe = regexp.MustCompile(`"type":\s*"([a-z_]+_error)"`)
+	trailingWaitRe = regexp.MustCompile(`(?:^|\s)retry-after-ms=([0-9]+)\s*$`)
+	providerWaitRe = regexp.MustCompile(`^Provider requested ([0-9]+)ms wait, exceeds retry\.maxDelayMs \([0-9]+ms\)\. Original error: `)
+	envelopeRe     = regexp.MustCompile(`^Anthropic stream error(?: \(([a-z_]+)\))?: `)
+	statusRe       = regexp.MustCompile(`^([1-5][0-9]{2}) `)
 )
 
-// classify reads one omp error text. It is a rate limit only by the
-// provider's own word: HTTP status 429 where omp gives a status, else the
-// structured type rate_limit_error. Message text never counts, so a 503 or
-// 529 (overloaded) is never a limit. wait finds the wait the text names.
-func classify(text string, wait *regexp.Regexp, retryEnd bool) failure {
-	f := failure{retryEnd: retryEnd}
-	if m := statusBodyRe.FindStringSubmatch(text); m != nil {
-		f.rateLimit = m[1] == "429"
-	} else if m := errorTypeRe.FindStringSubmatch(text); m != nil {
-		f.rateLimit = m[1] == "rate_limit_error"
+// classifyTurn reads a failed turn's errorMessage.
+func classifyTurn(text string) failure {
+	text = strings.TrimSpace(text)
+	m := trailingWaitRe.FindStringSubmatchIndex(text)
+	if m == nil {
+		return failure{rateLimit: isRateLimit(text)}
 	}
-	if m := wait.FindStringSubmatch(text); m != nil {
-		ms, err := strconv.ParseInt(m[1], 10, 64)
-		if err == nil && ms <= math.MaxInt64/int64(time.Millisecond) {
-			f.wait, f.hasWait = time.Duration(ms)*time.Millisecond, true
-		}
-	}
+	f := failure{rateLimit: isRateLimit(strings.TrimSpace(text[:m[0]]))}
+	f.wait, f.hasWait = parseMs(text[m[2]:m[3]])
 	return f
+}
+
+// classifyRetryEnd reads the finalError of a retry omp gave up on.
+func classifyRetryEnd(text string) failure {
+	text = strings.TrimSpace(text)
+	if m := providerWaitRe.FindStringSubmatchIndex(text); m != nil {
+		f := failure{rateLimit: classifyTurn(text[m[1]:]).rateLimit}
+		f.wait, f.hasWait = parseMs(text[m[2]:m[3]])
+		return f
+	}
+	return classifyTurn(text)
+}
+
+// isRateLimit reports whether a provider error, read only at its start, is a
+// rate limit: HTTP status 429; else, with no status, the wrapper's error
+// type or the JSON body's error.type rate_limit_error. A 503 or 529
+// (overloaded) is never one, whatever its message says.
+func isRateLimit(body string) bool {
+	typ := ""
+	if m := envelopeRe.FindStringSubmatchIndex(body); m != nil {
+		if m[2] >= 0 {
+			typ = body[m[2]:m[3]]
+		}
+		body = body[m[1]:]
+	}
+	if m := statusRe.FindStringSubmatch(body); m != nil {
+		return m[1] == "429"
+	}
+	if typ != "" {
+		return typ == "rate_limit_error"
+	}
+	if !strings.HasPrefix(body, "{") {
+		return false
+	}
+	var v struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if json.NewDecoder(strings.NewReader(body)).Decode(&v) != nil {
+		return false
+	}
+	return v.Error.Type == "rate_limit_error"
+}
+
+func parseMs(s string) (time.Duration, bool) {
+	ms, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || ms > math.MaxInt64/int64(time.Millisecond) {
+		return 0, false
+	}
+	return time.Duration(ms) * time.Millisecond, true
 }
 
 // ExtractJSON returns the JSON document in an agent's final answer: either

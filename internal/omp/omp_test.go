@@ -145,8 +145,18 @@ func TestUsageLimit(t *testing.T) {
 			gaveUp(`Provider requested 900000ms wait, exceeds retry.maxDelayMs (300000ms). Original error: ` + limit429), agentEnd}, 900 * time.Second},
 		{"limit, then a terminal 503 turn", []string{failedTurn(limitTurn), retryStart, failedTurn(overloaded503), agentEnd}, 0},
 		{"limit, then omp gave up on a 503", []string{failedTurn(limitTurn), retryStart, gaveUp(`Retry failed. Original error: ` + overloaded503), agentEnd}, 0},
-		{"gave up on the turn's limit without naming the wait", []string{failedTurn(limitTurn), retryStart, gaveUp(`Retry failed. Original error: ` + limit429), agentEnd}, 12769 * time.Second},
+		// omp's other give-up form is the original error itself, wait included.
+		{"gave up with the original error as finalError", []string{failedTurn(limitTurn), retryStart, gaveUp(limitTurn), agentEnd}, 12769 * time.Second},
+		// Each failure is judged on its own text: a wait never carries over.
 		{"wait never carries over to a separate request", []string{failedTurn(limitTurn), failedTurn(limit429), agentEnd}, 0},
+		{"a second 429 never inherits the first one's wait", []string{failedTurn(limitTurn), retryStart, gaveUp(limit429), failedTurn(limit429), agentEnd}, 0},
+		{"gave up without naming a wait", []string{failedTurn(limitTurn), retryStart, gaveUp(`Retry failed. Original error: ` + limit429), agentEnd}, 0},
+		// Review round 2 counterexamples.
+		{"statusless overloaded_error whose message says 429 {", []string{failedTurn(`{"type":"error","error":{"type":"overloaded_error","message":"upstream said 429 {busy}"}} retry-after-ms=900000`), agentEnd}, 0},
+		{"wrapped overloaded_error whose message says 429 {", []string{failedTurn(`Anthropic stream error (overloaded_error): upstream said 429 {busy} retry-after-ms=900000`), agentEnd}, 0},
+		{"local retry failure after a limit", []string{failedTurn(limitTurn), retryStart, gaveUp(`Retry continuation failed locally: socket closed. Original error: ` + limitTurn), agentEnd}, 0},
+		{"typed stream rate limit without a status", []string{failedTurn(`Anthropic stream error (rate_limit_error): This request would exceed your rate limit. retry-after-ms=900000`), agentEnd}, 900 * time.Second},
+		{"wait text inside the message is not the wait", []string{failedTurn(`Anthropic stream error (api_error): 429 {"type":"error","error":{"type":"rate_limit_error","message":"see retry-after-ms=900000 docs"}}`), agentEnd}, 0},
 		{"429 without retry-after", []string{failedTurn(limit429), agentEnd}, 0},
 		{"gave up on a 429 without a wait", []string{retryStart, gaveUp(`429 rate_limit_error`), agentEnd}, 0},
 		{"retry-after on another error", []string{failedTurn(`500 api_error retry-after-ms=4290`), agentEnd}, 0},
