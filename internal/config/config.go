@@ -60,10 +60,32 @@ type Agent struct {
 	AllowUnsafeLocal bool `yaml:"allow_unsafe_local"`
 	// Omp is the omp binary for the local executor (default "omp" on PATH).
 	Omp string `yaml:"omp"`
+	// UsageLimitWait is the longest provider usage limit an agent stage
+	// waits out (once) before retrying, as a Go duration (default 2m, at
+	// most 30m; 0 means the default). A longer limit skips the run.
+	UsageLimitWait Duration `yaml:"usage_limit_wait"`
 
 	Sandboxd     Sandboxd     `yaml:"sandboxd"`
 	ModelGateway ModelGateway `yaml:"model_gateway"`
 }
+
+// Duration is a Go duration in the settings file ("5m"), parsed once when
+// the file is read.
+type Duration time.Duration
+
+// UnmarshalYAML parses the duration.
+func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
+	v, err := time.ParseDuration(n.Value)
+	if err != nil {
+		return fmt.Errorf("line %d: %q is not a Go duration (e.g. 5m)", n.Line, n.Value)
+	}
+	*d = Duration(v)
+	return nil
+}
+
+// maxUsageLimitWait bounds agent.usage_limit_wait: a stage holds its run
+// open while it waits.
+const maxUsageLimitWait = 30 * time.Minute
 
 // maxParallelLimit bounds agent.sandboxd.max_parallel: a typo such as 30
 // for 3 should fail at load, not ask sandboxd for thirty VMs.
@@ -126,6 +148,9 @@ func (c Config) Validate() error {
 		return errors.New("config: events.max_payload_bytes must not be negative")
 	}
 	a := c.Agent
+	if d := time.Duration(a.UsageLimitWait); d < 0 || d > maxUsageLimitWait {
+		return fmt.Errorf("config: agent.usage_limit_wait %s must be from 0 to 30m (0 means 2m)", d)
+	}
 	switch a.Executor {
 	case ExecutorNone:
 	case ExecutorLocal:

@@ -5,6 +5,7 @@ package stage
 
 import (
 	"context"
+	"time"
 
 	"github.com/gitmoot/stagehand/internal/spec"
 )
@@ -18,6 +19,10 @@ const (
 	// Blocked parks the run without counting as a failure: the stage needs
 	// something (a decision, an input) before it can go on.
 	Blocked Outcome = "blocked"
+	// Limited means the model provider refused the attempt with a usage
+	// limit and asked to retry only after Result.RetryAfter. It is not a
+	// failure of the stage; the engine decides whether to wait or skip.
+	Limited Outcome = "limited"
 )
 
 // Job is one attempt of one stage.
@@ -63,6 +68,8 @@ type Result struct {
 	Cost         float64
 	InputTokens  int64
 	OutputTokens int64
+	// RetryAfter is how long the provider asked to wait (Limited only).
+	RetryAfter time.Duration
 }
 
 // Executor runs one attempt. It must return when ctx is done, after stopping

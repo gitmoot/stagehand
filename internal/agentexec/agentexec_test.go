@@ -130,6 +130,30 @@ func TestFailedTurnFailsEvenWhenOmpExitsZero(t *testing.T) {
 	}
 }
 
+// Run 2718: omp ended on a usage limit far beyond the 5 minutes it waits out
+// itself. That is not a failure of the stage: the engine gets Limited and how
+// long to wait.
+func TestUsageLimitIsLimitedNotFailed(t *testing.T) {
+	job := newJob(t, 1)
+	limit429 := `Anthropic stream error (api_error): 429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your rate limit."}}`
+	turn, _ := json.Marshal(limit429 + " retry-after-ms=12769000")
+	// As in run 2718's log: the original error keeps its own wait.
+	final, _ := json.Marshal("Provider requested 12769000ms wait, exceeds retry.maxDelayMs (300000ms). Original error: " + limit429 + " retry-after-ms=12769000")
+	be := &fakeBackend{lines: []string{
+		`{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":` + string(turn) + `,"content":[]}}`,
+		`{"type":"auto_retry_start"}`,
+		`{"type":"auto_retry_end","success":false,"finalError":` + string(final) + `}`,
+		end,
+	}}
+	res := Executor{Backend: be}.Execute(context.Background(), job)
+	if res.Outcome != stage.Limited || res.RetryAfter != 12769*time.Second {
+		t.Fatalf("%+v; want limited for 12769s", res)
+	}
+	if !strings.HasPrefix(res.Summary, "usage limit (retry after 3h32m49s): ") || !strings.Contains(res.Summary, "rate_limit_error") {
+		t.Errorf("summary %q", res.Summary)
+	}
+}
+
 func TestTimeoutReportsEngineCause(t *testing.T) {
 	job := newJob(t, 1)
 	ctx, cancel := context.WithTimeoutCause(context.Background(), 50*time.Millisecond, context.DeadlineExceeded)

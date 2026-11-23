@@ -68,7 +68,7 @@ stages:
 | `cmd` | Shell command, run as `sh -c` |
 | `cwd` | Absolute working directory. Default: the run's work directory |
 | `timeout` | Time limit, as a Go duration. Default: `1h` for shell stages |
-| `retry` | How many extra attempts a failed stage gets (0–10) |
+| `retry` | How many extra attempts a failed stage gets (0–10). A failed attempt is re-run immediately, with no delay. A usage limit never uses it (see [How a run works](#how-a-run-works)) |
 | `env_keys` | Variables the stage may see, taken from `env_file` first, then `env`. Nothing else is passed |
 
 Agent stage keys (`agent: omp`):
@@ -208,6 +208,31 @@ Unit files and an example config are in [`deploy/`](deploy/).
   - every stage that hasn't succeeded.
 
   A resumed stage gets a fresh `retry` budget.
+- **Usage limits:** when an agent stage's model call is refused with a provider usage limit
+  that states how long to wait, longer than omp waits out itself (5 minutes), the attempt is
+  recorded as `limited`, not `failed`. Only the provider's own form counts: an HTTP `429` whose
+  JSON body is a `rate_limit_error`, followed by the `retry-after-ms` that omp appends from the
+  response's retry headers. A 429 without a stated wait (omp may then guess a 30-minute backoff),
+  an overload, or any other error stays an ordinary failure.
+  - **Short limit** (the provider asked to wait at most `agent.usage_limit_wait`, default `2m`):
+    the stage stays `pending` until the limit ends, holding no agent slot, then runs once more.
+    That retry does not use the stage's `retry`, whatever `retry` says. A stage waits out one
+    limit per run, or per resume; a second one is treated as long.
+  - **Long limit:** the stage and the stages that depend on it are `skipped`, and the run ends
+    `skipped` with halt reason `usage limit until <time>`; `run parked` is not logged. A skipped
+    run is not resumable: the pipeline's next slot runs as usual. Scheduled slots that come due
+    before the limit ends are recorded as `skipped` at once, without running any stage (shell
+    stages included), for pipelines with an agent stage. `run` and events start runs as usual.
+  - **Event runs** never end `skipped`: a long limit blocks the stage (`usage limit until <time>;
+    resume after it`), so the run stays resumable, since the event is not delivered again.
+  - `run --wait`, `resume --wait` and `trigger --wait` exit **75** (EX_TEMPFAIL) for a skipped
+    run, instead of 1, and print `run #N skipped: usage limit until <time>; the next slot runs as
+    usual`.
+  - `status --json` shows `limited_until` on a pipeline while its limit lasts, and on its
+    `last_run` when a limit skipped it. `show <run-id> --json` shows it on the run and on the
+    stage and attempt the limit stopped.
+  - The wait is a runner setting: `agent: {usage_limit_wait: 5m}` in the settings file (a Go
+    duration from `0` to `30m`; `0` means the default `2m`).
 - **Spec snapshot:** each run keeps the spec it started with. Editing or replacing the pipeline
   never changes a run that is already in progress.
 - **One run at a time:** a pipeline has at most one running run. A schedule that comes due while
@@ -407,7 +432,8 @@ version
   - When another one-off command holds it, `run` and `resume` wait for the lock and then run
     their own stages. They are never left queued with nobody to run them.
   - When nobody holds it, the command runs the stages itself and returns when the run ends.
-- **Exit status:** `run` and `resume` exit non-zero unless the run succeeded.
+- **Exit status:** `run` and `resume` exit non-zero unless the run succeeded: 75 when a usage
+  limit skipped it, 130 when interrupted, 1 otherwise.
 
 ### Status for dashboards
 

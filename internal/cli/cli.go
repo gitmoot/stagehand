@@ -161,6 +161,10 @@ type exitCode int
 
 func (e exitCode) Error() string { return fmt.Sprintf("exit %d", int(e)) }
 
+// exitTempFail (EX_TEMPFAIL) is the exit status of a run a usage limit
+// skipped: try again later, nothing is broken. A failed run exits 1.
+const exitTempFail = 75
+
 type app struct {
 	cfg    config.Config
 	home   string
@@ -248,6 +252,7 @@ func open(ctx context.Context, home, configPath string, stderr io.Writer) (*app,
 		}}
 	}
 	eng := engine.New(st, home, executors, baseEnv(), log)
+	eng.UsageLimitWait = time.Duration(cfg.Agent.UsageLimitWait)
 	return &app{cfg: cfg, home: home, store: st, engine: eng, stderr: stderr, log: log}, nil
 }
 
@@ -412,6 +417,9 @@ func (a *app) printStatusTable(st engine.Status) error {
 			state = p.LastRun.State
 			cost = fmt.Sprintf("%.2f", p.LastRun.Cost)
 		}
+		if p.LimitedUntil != nil {
+			state += " (usage limit until " + timeText(p.LimitedUntil) + ")"
+		}
 		fmt.Fprintf(tw, "%s\t%v\t%s\t%s\t%s\t%s\t%s\n", p.Name, p.Enabled, sched, timeText(p.NextDueAt), last, state, cost)
 	}
 	return tw.Flush()
@@ -465,8 +473,11 @@ func (a *app) printRuns(runs []engine.RunSummary) error {
 	fmt.Fprintln(tw, "RUN\tTRIGGER\tSTATE\tSTARTED\tFINISHED\tCOST\tHALTED AT")
 	for _, r := range runs {
 		halt := "-"
-		if r.HaltStage != "" {
+		switch {
+		case r.HaltStage != "":
 			halt = r.HaltStage + ": " + r.HaltReason
+		case r.State == store.RunSkipped:
+			halt = r.HaltReason // a slot skipped before any stage ran
 		}
 		fmt.Fprintf(tw, "#%d\t%s\t%s\t%s\t%s\t%.2f\t%s\n", r.ID, r.Trigger, r.State, timeText(&r.CreatedAt), timeText(r.FinishedAt), r.Cost, halt)
 	}
@@ -477,6 +488,8 @@ func (a *app) printRun(d engine.RunDetail) error {
 	fmt.Fprintf(a.stdout, "run #%d of %s (%s): %s\n", d.ID, d.Pipeline, d.Trigger, d.State)
 	if d.HaltStage != "" {
 		fmt.Fprintf(a.stdout, "halted at %s: %s\n", d.HaltStage, d.HaltReason)
+	} else if d.State == store.RunSkipped {
+		fmt.Fprintf(a.stdout, "halted: %s\n", d.HaltReason)
 	}
 	fmt.Fprintf(a.stdout, "started %s, finished %s, cost %.4f (%d in / %d out tokens)\n\n",
 		timeText(&d.CreatedAt), timeText(d.FinishedAt), d.Cost, d.InputTokens, d.OutputTokens)
@@ -632,6 +645,14 @@ func (a *app) finish(ctx context.Context, id int64, wait, asJSON bool) error {
 			fmt.Fprintf(a.stderr, "interrupted; run #%d is parked: `stagehand resume %d` re-runs it\n", id, id)
 		}
 		return exitCode(130)
+	}
+	if d.State == store.RunSkipped {
+		reason := d.HaltReason
+		if d.LimitedUntil != nil {
+			reason = store.UsageLimitReason(*d.LimitedUntil)
+		}
+		fmt.Fprintf(a.stderr, "run #%d skipped: %s; the next slot runs as usual\n", id, reason)
+		return exitCode(exitTempFail)
 	}
 	if d.State != store.RunSucceeded {
 		return exitCode(1)
