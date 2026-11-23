@@ -7,6 +7,7 @@ package homelock
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -86,12 +87,16 @@ func (l *Lock) Release() error {
 	return err
 }
 
-// Holder reports who holds the lock at path, without taking it: the lock
-// file names the holder only while it is held (Release empties it), and a
-// holder that died without releasing is ignored. nil means nobody holds it.
-// It never contends for the lock, so it cannot delay an executor starting.
+// Holder reports who holds the lock at path, without taking it, so it can
+// never delay an executor. nil means nobody holds it. The lock file names
+// its holder only while held (Release empties it); the record is trusted
+// only if /proc/locks shows that very process holding a flock on this very
+// file, so a holder that died, or a recycled pid, is not reported. An
+// unreadable or malformed record, or a lock path that is not a regular file,
+// is an error: who holds it is unknown.
 func Holder(path string) (*HeldError, error) {
-	f, err := os.Open(path)
+	// Non-blocking, so a FIFO at the lock path cannot hang the caller.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
@@ -99,17 +104,58 @@ func Holder(path string) (*HeldError, error) {
 		return nil, err
 	}
 	defer f.Close()
-	if st, err := f.Stat(); err != nil {
+	st, err := f.Stat()
+	if err != nil {
 		return nil, err
-	} else if !st.Mode().IsRegular() {
+	}
+	if !st.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s is not a regular file", path)
 	}
-	he := readHolder(f)
-	if he.PID <= 0 {
-		return nil, nil
+	raw := make([]byte, 64)
+	n, err := f.ReadAt(raw, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
 	}
-	if err := syscall.Kill(he.PID, 0); err != nil && !errors.Is(err, syscall.EPERM) {
-		return nil, nil // the recorded holder is gone
+	fields := strings.Fields(string(raw[:n]))
+	if len(fields) == 0 {
+		return nil, nil // released
 	}
-	return he, nil
+	pid, perr := strconv.Atoi(fields[0])
+	if len(fields) != 2 || perr != nil || pid <= 0 {
+		return nil, fmt.Errorf("%s: unreadable holder record %q", path, raw[:n])
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil, fmt.Errorf("%s: no device and inode", path)
+	}
+	held, err := holdsFlock(pid, uint64(sys.Dev), uint64(sys.Ino))
+	if err != nil || !held {
+		return nil, err
+	}
+	return &HeldError{PID: pid, Mode: fields[1]}, nil
+}
+
+// locksFile is the kernel's table of held file locks (tests replace it).
+var locksFile = "/proc/locks"
+
+// holdsFlock reports whether pid holds a flock on the file dev/ino. Lines
+// read "1: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF" (major
+// and minor in hex); a waiter's line has "->" after the number and does not
+// count.
+func holdsFlock(pid int, dev, ino uint64) (bool, error) {
+	raw, err := os.ReadFile(locksFile)
+	if err != nil {
+		return false, err
+	}
+	major := (dev>>8)&0xfff | (dev>>32)&^uint64(0xfff)
+	minor := dev&0xff | (dev>>12)&^uint64(0xff)
+	file := fmt.Sprintf("%02x:%02x:%d", major, minor, ino)
+	owner := strconv.Itoa(pid)
+	for _, line := range strings.Split(string(raw), "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 6 && f[1] == "FLOCK" && f[4] == owner && f[5] == file {
+			return true, nil
+		}
+	}
+	return false, nil
 }
