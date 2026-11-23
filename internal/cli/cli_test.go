@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"github.com/gitmoot/stagehand/internal/homelock"
 	"os"
 	"path/filepath"
 	"strings"
@@ -132,5 +133,84 @@ func TestRunWaitExitsTempFailWhenAUsageLimitSkipsTheRun(t *testing.T) {
 	}
 	if !strings.Contains(out, "halted at r: usage limit until ") {
 		t.Errorf("stdout %q", out)
+	}
+}
+
+// With serve running, `run --json` and `resume --json` leave the run to serve
+// and print JSON, not text, so a caller can parse the run id (#27).
+func TestRunAndResumeQueuedPrintJSON(t *testing.T) {
+	home := t.TempDir()
+	dir := t.TempDir()
+	// One pipeline per command: a pipeline has one active run at a time.
+	for _, name := range []string{"p", "q"} {
+		spec := filepath.Join(dir, name+".yaml")
+		os.WriteFile(spec, []byte("name: "+name+"\nstages:\n  - {id: a, cmd: 'false'}\n"), 0o600)
+		if code, _, errs := runCLI(home, "add", spec, "--enable"); code != 0 {
+			t.Fatal(errs)
+		}
+	}
+	// A failed run to resume later, executed here while nothing holds the lock.
+	if code, _, _ := runCLI(home, "run", "p", "--wait"); code != 1 {
+		t.Fatalf("setup run exit %d, want 1", code)
+	}
+	serve, err := homelock.TryAcquire(filepath.Join(home, "stagehand.lock"), homelock.ModeServe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serve.Release()
+	for _, c := range []struct {
+		args     []string
+		pipeline string
+	}{{[]string{"run", "q", "--json"}, "q"}, {[]string{"resume", "1", "--json"}, "p"}} {
+		args := c.args
+		code, out, errs := runCLI(home, args...)
+		var q struct {
+			ID       int64  `json:"id"`
+			Pipeline string `json:"pipeline"`
+			State    string `json:"state"`
+			Executor string `json:"executor"`
+		}
+		if code != 0 || json.Unmarshal([]byte(out), &q) != nil || q.ID == 0 || q.Pipeline != c.pipeline || q.State != "queued" || q.Executor != "serve" {
+			t.Errorf("%v: exit %d, stdout %q (stderr %q); want queued JSON for serve", args, code, out, errs)
+		}
+	}
+}
+
+// --queue never executes here, so a caller with a short timeout cannot be
+// held by a long run and leave it parked. Without serve it still queues,
+// and says who will start it (#27).
+func TestQueueNeverExecutesHere(t *testing.T) {
+	home := t.TempDir()
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "ran")
+	spec := filepath.Join(dir, "p.yaml")
+	os.WriteFile(spec, []byte("name: p\nstages:\n  - {id: a, cmd: 'touch "+marker+"'}\n"), 0o600)
+	if code, _, errs := runCLI(home, "add", spec, "--enable"); code != 0 {
+		t.Fatal(errs)
+	}
+	code, out, errs := runCLI(home, "run", "p", "--queue", "--json")
+	var q struct {
+		ID       int64  `json:"id"`
+		State    string `json:"state"`
+		Executor string `json:"executor"`
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &q) != nil || q.State != "queued" || q.Executor != "none" {
+		t.Fatalf("exit %d, stdout %q; want queued JSON with executor none", code, out)
+	}
+	if !strings.Contains(errs, "no stagehand serve is running") {
+		t.Errorf("stderr %q; want a warning that nothing executes it yet", errs)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("--queue executed the run")
+	}
+	// The next tick runs it.
+	if code, _, errs := runCLI(home, "tick"); code != 0 {
+		t.Fatal(errs)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Error("the queued run did not run on the next tick")
+	}
+	if code, _, _ := runCLI(home, "run", "p", "--queue", "--wait"); code == 0 {
+		t.Error("--queue with --wait accepted")
 	}
 }

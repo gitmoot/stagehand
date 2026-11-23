@@ -46,9 +46,10 @@ Pipelines:
   remove <name>                            delete a pipeline (its runs stay)
 
 Runs:
-  run <name> [--wait] [--json]             start a run (executes here unless serve is running)
+  run <name> [--wait|--queue] [--json]     start a run (executes here unless serve is running)
   runs <name> [--limit N] [--json]         newest runs of a pipeline
-  resume <run-id> [--from STAGE] [--wait]  re-run a parked run from a stage
+  resume <run-id> [--from STAGE] [--wait|--queue] [--json]
+                                           re-run a parked run from a stage
   cancel <run-id>                          stop a running run
 
 Events:
@@ -545,16 +546,23 @@ func (a *app) runs(ctx context.Context, args []string) error {
 func (a *app) run(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	wait := fs.Bool("wait", false, "")
+	queue := fs.Bool("queue", false, "")
 	asJSON := fs.Bool("json", false, "")
-	pos, err := parse(fs, args, 1, "run <name> [--wait] [--json]")
+	pos, err := parse(fs, args, 1, "run <name> [--wait|--queue] [--json]")
 	if err != nil {
 		return err
+	}
+	if *wait && *queue {
+		return errors.New("--wait and --queue exclude each other")
 	}
 	id, err := a.engine.StartRun(ctx, pos[0], "manual")
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(a.stderr, "run #%d created\n", id)
+	if *queue {
+		return a.reportQueued(ctx, id, a.serveRunning(), *asJSON)
+	}
 	return a.finish(ctx, id, *wait, *asJSON)
 }
 
@@ -562,10 +570,14 @@ func (a *app) resume(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("resume", flag.ContinueOnError)
 	from := fs.String("from", "", "")
 	wait := fs.Bool("wait", false, "")
+	queue := fs.Bool("queue", false, "")
 	asJSON := fs.Bool("json", false, "")
-	pos, err := parse(fs, args, 1, "resume <run-id> [--from STAGE] [--wait] [--json]")
+	pos, err := parse(fs, args, 1, "resume <run-id> [--from STAGE] [--wait|--queue] [--json]")
 	if err != nil {
 		return err
+	}
+	if *wait && *queue {
+		return errors.New("--wait and --queue exclude each other")
 	}
 	id, err := strconv.ParseInt(pos[0], 10, 64)
 	if err != nil {
@@ -575,6 +587,9 @@ func (a *app) resume(ctx context.Context, args []string) error {
 		return err
 	}
 	fmt.Fprintf(a.stderr, "run #%d resumed\n", id)
+	if *queue {
+		return a.reportQueued(ctx, id, a.serveRunning(), *asJSON)
+	}
 	return a.finish(ctx, id, *wait, *asJSON)
 }
 
@@ -623,8 +638,10 @@ func (a *app) finish(ctx context.Context, id int64, wait, asJSON bool) error {
 		return err
 	}
 	if !executed && err == nil && !wait {
-		fmt.Fprintf(a.stdout, "run #%d queued; the running stagehand serve executes it (stagehand show %d)\n", id, id)
-		return nil
+		// serve executes it, unless another process already settled it.
+		if r, gerr := a.store.GetRun(ctx, id); gerr == nil && r.State == store.RunRunning {
+			return a.reportQueued(ctx, id, true, asJSON)
+		}
 	}
 	d, derr := a.engine.Run(context.WithoutCancel(ctx), id)
 	if derr != nil {
@@ -658,6 +675,53 @@ func (a *app) finish(ctx context.Context, id int64, wait, asJSON bool) error {
 		return exitCode(1)
 	}
 	return nil
+}
+
+// queuedRun is what run and resume print, with --json, for a run they leave
+// to another process.
+type queuedRun struct {
+	ID       int64  `json:"id"`
+	Pipeline string `json:"pipeline"`
+	State    string `json:"state"` // always "queued"
+	// Executor is "serve" when a running serve executes it, else "none":
+	// the next serve or tick starts it.
+	Executor string `json:"executor"`
+}
+
+// reportQueued prints a run left for serve (or, with --queue and no serve,
+// for the next serve or tick).
+func (a *app) reportQueued(ctx context.Context, id int64, serve bool, asJSON bool) error {
+	r, err := a.store.GetRun(ctx, id)
+	if err != nil {
+		return err
+	}
+	q := queuedRun{ID: id, Pipeline: r.Pipeline, State: "queued", Executor: "none"}
+	if serve {
+		q.Executor = "serve"
+	} else {
+		fmt.Fprintf(a.stderr, "no stagehand serve is running: run #%d starts when `stagehand serve` or `stagehand tick` runs\n", id)
+	}
+	if asJSON {
+		return a.printJSON(q)
+	}
+	if serve {
+		fmt.Fprintf(a.stdout, "run #%d queued; the running stagehand serve executes it (stagehand show %d)\n", id, id)
+	} else {
+		fmt.Fprintf(a.stdout, "run #%d queued (stagehand show %d)\n", id, id)
+	}
+	return nil
+}
+
+// serveRunning reports whether a stagehand serve holds the home lock. It
+// takes the lock only to test it, and releases it at once.
+func (a *app) serveRunning() bool {
+	lock, err := homelock.TryAcquire(filepath.Join(a.home, "stagehand.lock"), homelock.ModeCLI)
+	if err == nil {
+		lock.Release()
+		return false
+	}
+	var held *homelock.HeldError
+	return errors.As(err, &held) && held.Mode == homelock.ModeServe
 }
 
 // lockPoll is how often a waiting command retries the home lock.
