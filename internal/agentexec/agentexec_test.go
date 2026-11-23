@@ -137,7 +137,8 @@ func TestUsageLimitIsLimitedNotFailed(t *testing.T) {
 	job := newJob(t, 1)
 	limit429 := `Anthropic stream error (api_error): 429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your rate limit."}}`
 	turn, _ := json.Marshal(limit429 + " retry-after-ms=12769000")
-	final, _ := json.Marshal("Provider requested 12769000ms wait, exceeds retry.maxDelayMs (300000ms). Original error: " + limit429)
+	// As in run 2718's log: the original error keeps its own wait.
+	final, _ := json.Marshal("Provider requested 12769000ms wait, exceeds retry.maxDelayMs (300000ms). Original error: " + limit429 + " retry-after-ms=12769000")
 	be := &fakeBackend{lines: []string{
 		`{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":` + string(turn) + `,"content":[]}}`,
 		`{"type":"auto_retry_start"}`,

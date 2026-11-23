@@ -79,7 +79,10 @@ type message struct {
 	Usage        *usage          `json:"usage"`
 	StopReason   string          `json:"stopReason"`
 	ErrorMessage string          `json:"errorMessage"`
-	Model        string          `json:"model"`
+	// ErrorStatus is the HTTP status omp took from the response, when it had
+	// one (a stream error inside an HTTP 200 has none).
+	ErrorStatus *int   `json:"errorStatus"`
+	Model       string `json:"model"`
 }
 
 type part struct {
@@ -121,13 +124,12 @@ type Stream struct {
 }
 
 // failure is the latest failed turn, or the latest retry omp gave up on, as
-// a usage limit sees it. Each is judged on its own text: omp writes the wait
-// into the same text as the error it belongs to, so nothing carries over
-// from an earlier event.
+// a usage limit sees it. Each is judged on its own text: omp writes the
+// provider's wait into the same text as the error it belongs to, so nothing
+// carries over from an earlier event.
 type failure struct {
-	rateLimit bool          // the provider's 429 / rate_limit_error
-	wait      time.Duration // the wait the provider asked for (hasWait)
-	hasWait   bool
+	limited bool          // a provider usage limit with a provider-stated wait
+	wait    time.Duration // that wait
 }
 
 // Feed reads one line of omp's stdout. Lines that are not JSON or not one of
@@ -165,7 +167,10 @@ func (s *Stream) Feed(line []byte) {
 				s.firstErr = err
 			}
 			s.turnFailed = true
-			s.last = classifyTurn(m.ErrorMessage)
+			s.last = failure{}
+			if m.ErrorStatus == nil || *m.ErrorStatus == 429 {
+				s.last.wait, s.last.limited = providerLimit(m.ErrorMessage)
+			}
 		} else if !s.gaveUp && carriesContent(parts) {
 			// A later real answer recovers from an earlier failed turn
 			// (omp retried or fell back to another model).
@@ -213,11 +218,11 @@ func (s *Stream) Messages() int { return s.messages }
 
 // UsageLimit reports whether the run failed on a provider usage limit, and
 // how long the provider asked to wait: the failure that ended the run is a
-// 429 / rate_limit_error that named a wait omp would not sit out. omp itself
-// waits out short ones within the attempt; a 429 without a wait, or a limit
-// followed by another failure, is an ordinary failure.
+// provider 429 rate_limit_error that stated a wait omp would not sit out
+// (omp waits out short ones within the attempt). Anything else, including a
+// limit followed by another failure, is an ordinary failure.
 func (s *Stream) UsageLimit() (retryAfter time.Duration, ok bool) {
-	if s.unreadable != nil || !s.turnFailed || !s.last.rateLimit || !s.last.hasWait {
+	if s.unreadable != nil || !s.turnFailed || !s.last.limited {
 		return 0, false
 	}
 	return s.last.wait, true
@@ -290,87 +295,68 @@ func assistantError(m *message) error {
 	return fmt.Errorf("omp turn failed (stopReason %s): %s", m.StopReason, detail)
 }
 
-// omp's error texts, as omp 18 writes them (packages/ai):
+// A usage limit is recognised only in the exact form the provider path
+// produces (omp 18, packages/ai: the SDK's HTTP error message, which omp may
+// wrap, plus the wait omp appends from the response's retry headers):
 //
-//	failed turn:  <provider error>[ retry-after-ms=N]
-//	              where the provider error is the SDK message, "<status> <JSON body>",
-//	              optionally wrapped as "Anthropic stream error[ (<type>)]: ...", and
-//	              " retry-after-ms=N" is appended at the very end only when the HTTP
-//	              response carried retry headers.
-//	gave up:      Provider requested Nms wait, exceeds retry.maxDelayMs (Mms). Original error: <provider error>
-//	              or the original <provider error> itself,
-//	              or "Retry continuation failed locally: ... Original error: ...", a local
-//	              failure: its start is no provider status, so it is never a limit.
+//	[Anthropic stream error[ (api_error)]: ]429 <JSON body, error.type rate_limit_error> retry-after-ms=N
 //
-// Only these positions are read; message text never is.
+// The wait must come right after the JSON body ends, so text inside the body
+// can never supply it. When omp gives up, its finalError is that error
+// itself or "Provider requested Nms wait, ... Original error: <that error>";
+// the wait is always the original error's own, because omp's "requested"
+// figure can be its own guess (a 30-minute backoff when the provider stated
+// none). Every other form (a specific stream error type such as
+// overloaded_error, free-form text, "Retry continuation failed locally")
+// is an ordinary failure, as before usage limits were recognised.
 var (
-	trailingWaitRe = regexp.MustCompile(`(?:^|\s)retry-after-ms=([0-9]+)\s*$`)
-	providerWaitRe = regexp.MustCompile(`^Provider requested ([0-9]+)ms wait, exceeds retry\.maxDelayMs \([0-9]+ms\)\. Original error: `)
+	providerWaitRe = regexp.MustCompile(`^Provider requested [0-9]+ms wait, exceeds retry\.maxDelayMs \([0-9]+ms\)\. Original error: `)
 	envelopeRe     = regexp.MustCompile(`^Anthropic stream error(?: \(([a-z_]+)\))?: `)
-	statusRe       = regexp.MustCompile(`^([1-5][0-9]{2}) `)
 )
-
-// classifyTurn reads a failed turn's errorMessage.
-func classifyTurn(text string) failure {
-	text = strings.TrimSpace(text)
-	m := trailingWaitRe.FindStringSubmatchIndex(text)
-	if m == nil {
-		return failure{rateLimit: isRateLimit(text)}
-	}
-	f := failure{rateLimit: isRateLimit(strings.TrimSpace(text[:m[0]]))}
-	f.wait, f.hasWait = parseMs(text[m[2]:m[3]])
-	return f
-}
 
 // classifyRetryEnd reads the finalError of a retry omp gave up on.
 func classifyRetryEnd(text string) failure {
 	text = strings.TrimSpace(text)
-	if m := providerWaitRe.FindStringSubmatchIndex(text); m != nil {
-		f := failure{rateLimit: classifyTurn(text[m[1]:]).rateLimit}
-		f.wait, f.hasWait = parseMs(text[m[2]:m[3]])
-		return f
+	if m := providerWaitRe.FindStringIndex(text); m != nil {
+		text = text[m[1]:]
 	}
-	return classifyTurn(text)
+	var f failure
+	f.wait, f.limited = providerLimit(text)
+	return f
 }
 
-// isRateLimit reports whether a provider error, read only at its start, is a
-// rate limit: HTTP status 429; else, with no status, the wrapper's error
-// type or the JSON body's error.type rate_limit_error. A 503 or 529
-// (overloaded) is never one, whatever its message says.
-func isRateLimit(body string) bool {
-	typ := ""
-	if m := envelopeRe.FindStringSubmatchIndex(body); m != nil {
-		if m[2] >= 0 {
-			typ = body[m[2]:m[3]]
+// providerLimit returns the provider-stated wait when text is a provider
+// usage limit in the exact form above.
+func providerLimit(text string) (time.Duration, bool) {
+	text = strings.TrimSpace(text)
+	if m := envelopeRe.FindStringSubmatchIndex(text); m != nil {
+		if m[2] >= 0 && text[m[2]:m[3]] != "api_error" {
+			return 0, false // a specific stream error type is not an HTTP 429
 		}
-		body = body[m[1]:]
+		text = text[m[1]:]
 	}
-	if m := statusRe.FindStringSubmatch(body); m != nil {
-		return m[1] == "429"
+	body, ok := strings.CutPrefix(text, "429 ")
+	if !ok || !strings.HasPrefix(body, "{") {
+		return 0, false
 	}
-	if typ != "" {
-		return typ == "rate_limit_error"
-	}
-	if !strings.HasPrefix(body, "{") {
-		return false
-	}
+	dec := json.NewDecoder(strings.NewReader(body))
 	var v struct {
 		Error struct {
 			Type string `json:"type"`
 		} `json:"error"`
 	}
-	if json.NewDecoder(strings.NewReader(body)).Decode(&v) != nil {
-		return false
-	}
-	return v.Error.Type == "rate_limit_error"
-}
-
-func parseMs(s string) (time.Duration, bool) {
-	ms, err := strconv.ParseInt(s, 10, 64)
-	if err != nil || ms > math.MaxInt64/int64(time.Millisecond) {
+	if dec.Decode(&v) != nil || v.Error.Type != "rate_limit_error" {
 		return 0, false
 	}
-	return time.Duration(ms) * time.Millisecond, true
+	n, ok := strings.CutPrefix(strings.TrimSpace(body[dec.InputOffset():]), "retry-after-ms=")
+	if !ok {
+		return 0, false
+	}
+	ms, err := strconv.ParseFloat(n, 64)
+	if err != nil || math.IsNaN(ms) || ms <= 0 || ms > float64(math.MaxInt64/int64(time.Millisecond)) {
+		return 0, false
+	}
+	return time.Duration(math.Ceil(ms)) * time.Millisecond, true
 }
 
 // ExtractJSON returns the JSON document in an agent's final answer: either
