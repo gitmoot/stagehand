@@ -236,7 +236,7 @@ func TestResumeGetsAFreshRetryBudget(t *testing.T) {
 	if d := h.runToEnd(id); d.State != store.RunFailed {
 		t.Fatalf("first pass %s, want failed", d.State)
 	}
-	if err := h.eng.Resume(context.Background(), id, ""); err != nil {
+	if _, err := h.eng.Resume(context.Background(), id, ""); err != nil {
 		t.Fatal(err)
 	}
 	d := h.runToEnd(id)
@@ -259,7 +259,7 @@ func TestBlockedStageParksRunWithNeeds(t *testing.T) {
 			t.Errorf("needs %v", s.Needs)
 		}
 	}
-	if err := h.eng.Resume(context.Background(), id, ""); err != nil {
+	if _, err := h.eng.Resume(context.Background(), id, ""); err != nil {
 		t.Fatal(err)
 	}
 	d = h.runToEnd(id)
@@ -276,7 +276,7 @@ func TestResumeFromEarlierStageRerunsItsDependentsOnly(t *testing.T) {
 	h.add(diamond, false)
 	id := h.start("p")
 	h.runToEnd(id)
-	if err := h.eng.Resume(context.Background(), id, "b"); err != nil {
+	if _, err := h.eng.Resume(context.Background(), id, "b"); err != nil {
 		t.Fatal(err)
 	}
 	if d := h.runToEnd(id); d.State != store.RunSucceeded {
@@ -294,11 +294,11 @@ func TestResumeRefusesRunningOrSucceededRun(t *testing.T) {
 	h := newHarness(t, nil)
 	h.add(diamond, false)
 	id := h.start("p")
-	if err := h.eng.Resume(context.Background(), id, "a"); err == nil {
+	if _, err := h.eng.Resume(context.Background(), id, "a"); err == nil {
 		t.Error("resumed a running run")
 	}
 	h.runToEnd(id)
-	if err := h.eng.Resume(context.Background(), id, "a"); err == nil {
+	if _, err := h.eng.Resume(context.Background(), id, "a"); err == nil {
 		t.Error("resumed a succeeded run")
 	}
 }
@@ -634,7 +634,7 @@ func TestStatusShowsResumedOlderRunAsActive(t *testing.T) {
 	h.runToEnd(old) // fails
 	newer := h.start("p")
 	h.runToEnd(newer) // succeeds
-	if err := h.eng.Resume(context.Background(), old, ""); err != nil {
+	if _, err := h.eng.Resume(context.Background(), old, ""); err != nil {
 		t.Fatal(err)
 	}
 	st, err := h.eng.Status(context.Background(), "test")

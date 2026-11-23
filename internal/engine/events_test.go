@@ -176,7 +176,7 @@ func TestRetentionDeletesOnSuccessAndKeepsParkedRuns(t *testing.T) {
 		t.Fatal("payload of a parked run was deleted; it must survive for resume")
 	}
 	// Resume works and, once it succeeds, the payload goes.
-	if err := h.eng.Resume(ctx, badRun.ID, ""); err != nil {
+	if _, err := h.eng.Resume(ctx, badRun.ID, ""); err != nil {
 		t.Fatal(err)
 	}
 	h.runToEnd(badRun.ID)
@@ -199,7 +199,7 @@ func TestPurgedRunCannotResume(t *testing.T) {
 	if _, err := os.Stat(ev.PayloadPath); !os.IsNotExist(err) {
 		t.Error("purge left the payload")
 	}
-	if err := h.eng.Resume(ctx, ev.RunID, ""); err == nil {
+	if _, err := h.eng.Resume(ctx, ev.RunID, ""); err == nil {
 		t.Error("resumed a run whose files were deleted")
 	}
 }
@@ -365,7 +365,7 @@ func TestPurgeAndResumeAreMutuallyExclusive(t *testing.T) {
 	if _, err := h.eng.Store.ClaimFilesDeletion(ctx, ev.RunID, h.now); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.eng.Resume(ctx, ev.RunID, ""); err == nil {
+	if _, err := h.eng.Resume(ctx, ev.RunID, ""); err == nil {
 		t.Fatal("resume accepted a run already claimed for deletion")
 	}
 	// And the other order: once resumed (running), it cannot be claimed.
@@ -374,7 +374,7 @@ func TestPurgeAndResumeAreMutuallyExclusive(t *testing.T) {
 	res2, _ := h2.trigger("q", "secret")
 	h2.drain()
 	ev2, _ := h2.eng.Store.GetEvent(ctx, res2.Event.ID)
-	if err := h2.eng.Resume(ctx, ev2.RunID, ""); err != nil {
+	if _, err := h2.eng.Resume(ctx, ev2.RunID, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h2.eng.Store.ClaimFilesDeletion(ctx, ev2.RunID, h2.now); !errors.Is(err, store.ErrNotDeletable) {

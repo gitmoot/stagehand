@@ -264,32 +264,32 @@ func stageIDs(sp spec.Spec) []string {
 // Resume re-runs a parked run from a stage: that stage, everything that
 // depends on it, and every stage that has not succeeded go back to pending.
 // from defaults to the stage the run halted on.
-func (e *Engine) Resume(ctx context.Context, runID int64, from string) error {
+func (e *Engine) Resume(ctx context.Context, runID int64, from string) (pipeline string, err error) {
 	run, err := e.Store.GetRun(ctx, runID)
 	if err != nil {
-		return err
+		return "", err
 	}
 	sp, err := spec.Load(run.SpecYAML)
 	if err != nil {
-		return fmt.Errorf("run %d spec snapshot: %w", runID, err)
+		return "", fmt.Errorf("run %d spec snapshot: %w", runID, err)
 	}
 	if run.State == store.RunSkipped {
 		// Refused before --from is needed: a slot skipped before it started
 		// has no halted stage. ResumeRun refuses it too.
-		return fmt.Errorf("run %d: %w", runID, store.ErrSkippedRun)
+		return "", fmt.Errorf("run %d: %w", runID, store.ErrSkippedRun)
 	}
 	if from == "" {
 		from = run.HaltStage
 	}
 	if from == "" {
-		return fmt.Errorf("run %d has no halted stage; pass --from <stage>", runID)
+		return "", fmt.Errorf("run %d has no halted stage; pass --from <stage>", runID)
 	}
 	if _, ok := sp.Stage(from); !ok {
-		return fmt.Errorf("run %d has no stage %q", runID, from)
+		return "", fmt.Errorf("run %d has no stage %q", runID, from)
 	}
 	stages, err := e.Store.ListStages(ctx, runID)
 	if err != nil {
-		return err
+		return "", err
 	}
 	reset := map[string]bool{}
 	for _, id := range sp.Dependents(from) {
@@ -307,11 +307,11 @@ func (e *Engine) Resume(ctx context.Context, runID int64, from string) error {
 		}
 	}
 	if err := e.Store.ResumeRun(ctx, runID, ids); err != nil {
-		return err
+		return "", err
 	}
 	e.Log.Info("run resumed", "run", runID, "from", from, "stages", ids)
 	e.signal()
-	return nil
+	return run.Pipeline, nil
 }
 
 // Cancel asks for a running run to stop. The lock holder kills its running

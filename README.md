@@ -428,17 +428,15 @@ version
 - **One executor per home:** only one process runs stages for a home at a time, enforced by a
   lock on `stagehand.lock`. While held, the lock file names its holder (`serve` or a one-off
   command). Who runs a `run` or `resume`:
-  - **`--queue`:** never runs anything here; the run is recorded and the command returns at
-    once, exit 0, so a caller with a short timeout cannot be held by a long run. It reads the
-    lock file without taking the lock (so it never delays serve or tick), and trusts it only if
-    `/proc/locks` shows that process holding the lock. It says who starts
-    the run: with `--json`, `{"id": N, "pipeline": "…", "state": "queued", "executor": "…"}`,
-    where `executor` is `serve`, `none` (the next `serve` or `tick` starts it, with a warning) or
-    `unknown` (the lock file could not be read). `--queue` and `--wait` exclude each other.
+  - **`--queue`:** never runs anything here and never touches the lock: the run is recorded and
+    the command returns at once, exit 0, so a caller with a short timeout cannot be held by a
+    long run. A running `serve`, or the next `serve` or `tick`, starts it (whether serve runs is
+    the service manager's answer, e.g. `systemctl is-active stagehand`). With `--json` it prints
+    `{"id": N, "pipeline": "…", "state": "queued"}`. `--queue` and `--wait` exclude each other.
   - **`serve` holds the lock:** `run` and `resume` record the run and `serve` carries it out.
-    Without `--wait` they return at once, exit 0 (`--json`: the same object,
-    `"executor": "serve"`). With `--wait` they wait for the result, and take over if `serve`
-    goes away. `cancel` records the request and `serve` stops the run.
+    Without `--wait` they return at once, exit 0 (`--json`: the same object). With `--wait` they
+    wait for the result, and take over if `serve` goes away. `cancel` records the request and
+    `serve` stops the run.
   - **Another one-off command holds it:** `run` and `resume` wait for the lock, then run their
     own stages. They are never left queued with nobody to run them.
   - **Nobody holds it:** the command runs the stages itself and returns when the run ends.

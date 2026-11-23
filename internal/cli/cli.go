@@ -561,7 +561,7 @@ func (a *app) run(ctx context.Context, args []string) error {
 	}
 	fmt.Fprintf(a.stderr, "run #%d created\n", id)
 	if *queue {
-		return a.reportQueued(id, pos[0], a.executor(), *asJSON)
+		return a.reportQueued(id, pos[0], false, *asJSON)
 	}
 	return a.finish(ctx, id, *wait, *asJSON)
 }
@@ -583,18 +583,13 @@ func (a *app) resume(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("run id %q is not a number", pos[0])
 	}
-	// Read before resuming: once the resume commits, only the receipt is
-	// left to print, and nothing may fail it.
-	r, err := a.store.GetRun(ctx, id)
+	pipeline, err := a.engine.Resume(ctx, id, *from)
 	if err != nil {
-		return err
-	}
-	if err := a.engine.Resume(ctx, id, *from); err != nil {
 		return err
 	}
 	fmt.Fprintf(a.stderr, "run #%d resumed\n", id)
 	if *queue {
-		return a.reportQueued(id, r.Pipeline, a.executor(), *asJSON)
+		return a.reportQueued(id, pipeline, false, *asJSON)
 	}
 	return a.finish(ctx, id, *wait, *asJSON)
 }
@@ -646,7 +641,7 @@ func (a *app) finish(ctx context.Context, id int64, wait, asJSON bool) error {
 	if !executed && err == nil && !wait {
 		// serve executes it, unless another process already settled it.
 		if r, gerr := a.store.GetRun(ctx, id); gerr == nil && r.State == store.RunRunning {
-			return a.reportQueued(id, r.Pipeline, executorServe, asJSON)
+			return a.reportQueued(id, r.Pipeline, true, asJSON)
 		}
 	}
 	d, derr := a.engine.Run(context.WithoutCancel(ctx), id)
@@ -683,57 +678,29 @@ func (a *app) finish(ctx context.Context, id int64, wait, asJSON bool) error {
 	return nil
 }
 
-// queuedRun is what run and resume print, with --json, for a run they leave
-// to another process.
+// queuedRun is what run and resume print, with --json, for a run they
+// leave to another process: serve, or (--queue) whichever serve or tick runs
+// next. It says nothing about who that is: a process that does not hold the
+// home lock cannot know that reliably (#43).
 type queuedRun struct {
 	ID       int64  `json:"id"`
 	Pipeline string `json:"pipeline"`
 	State    string `json:"state"` // always "queued"
-	// Executor is who starts it: "serve" (a running serve), "none" (the
-	// next serve or tick), or "unknown" (the lock file could not be read).
-	Executor string `json:"executor"`
 }
 
-const (
-	executorServe   = "serve"
-	executorNone    = "none"
-	executorUnknown = "unknown"
-)
-
-// reportQueued prints a run left for serve, or (--queue) for whoever runs
-// next. The run is already committed: printing is all that is left.
-func (a *app) reportQueued(id int64, pipeline, executor string, asJSON bool) error {
-	switch executor {
-	case executorNone:
-		fmt.Fprintf(a.stderr, "no stagehand serve is running: run #%d starts when `stagehand serve` or `stagehand tick` runs\n", id)
-	case executorUnknown:
-		fmt.Fprintf(a.stderr, "could not tell whether stagehand serve is running: run #%d is queued, and starts when serve or tick runs\n", id)
-	}
+// reportQueued prints a run left to another process. toServe is set only
+// when this command found serve holding the lock (and so handed it over).
+// The run is already committed: printing is all that is left.
+func (a *app) reportQueued(id int64, pipeline string, toServe, asJSON bool) error {
 	if asJSON {
-		return a.printJSON(queuedRun{ID: id, Pipeline: pipeline, State: "queued", Executor: executor})
+		return a.printJSON(queuedRun{ID: id, Pipeline: pipeline, State: "queued"})
 	}
-	if executor == executorServe {
+	if toServe {
 		fmt.Fprintf(a.stdout, "run #%d queued; the running stagehand serve executes it (stagehand show %d)\n", id, id)
 	} else {
-		fmt.Fprintf(a.stdout, "run #%d queued (stagehand show %d)\n", id, id)
+		fmt.Fprintf(a.stdout, "run #%d queued; `stagehand serve` or `stagehand tick` starts it (stagehand show %d)\n", id, id)
 	}
 	return nil
-}
-
-// executor tells who will start a queued run by reading the lock file's
-// holder. It never takes the lock, so it cannot keep serve or tick from
-// starting (#38).
-func (a *app) executor() string {
-	h, err := homelock.Holder(filepath.Join(a.home, "stagehand.lock"))
-	switch {
-	case err != nil:
-		fmt.Fprintf(a.stderr, "stagehand: lock file: %v\n", err)
-		return executorUnknown
-	case h != nil && h.Mode == homelock.ModeServe:
-		return executorServe
-	default:
-		return executorNone
-	}
 }
 
 // lockPoll is how often a waiting command retries the home lock.
