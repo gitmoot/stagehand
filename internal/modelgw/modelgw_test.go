@@ -447,3 +447,38 @@ func TestPortRisk(t *testing.T) {
 		}
 	}
 }
+
+// The port is resolved as net.Listen resolves it, service names included.
+func TestListenRiskResolvesServiceNames(t *testing.T) {
+	dir := t.TempDir()
+	for name, body := range map[string]string{"ip_local_port_range": "1\t65535\n", "ip_local_reserved_ports": "\n"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if listenRisk(dir, "127.0.0.1:http") == "" {
+		t.Error("127.0.0.1:http (port 80, unreserved, in range) not reported")
+	}
+}
+
+// A competing listener on an unreserved port gets both explanations: who
+// holds the port is unknown, and reserving it would not move a listener.
+func TestBindErrorKeepsBothHints(t *testing.T) {
+	held, err := net.Listen("tcp", "127.0.0.1:0") // a kernel-chosen, hence ephemeral and unreserved, port
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	g := newGateway(t, held.Addr().String(), "http://127.0.0.1:1")
+	if g.PortRisk() == "" {
+		t.Skip("kernel port settings unreadable here")
+	}
+	token, _ := NewToken()
+	_, err = g.Open(token, Identity{Pipeline: "p", RunID: 1})
+	if err == nil {
+		t.Fatal("bound a held port")
+	}
+	if msg := err.Error(); !strings.Contains(msg, "another runner") || !strings.Contains(msg, "ip_local_reserved_ports") {
+		t.Errorf("error %q: want both the competing-listener and the reservation hint", msg)
+	}
+}
