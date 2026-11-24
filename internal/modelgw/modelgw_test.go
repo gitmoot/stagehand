@@ -39,13 +39,15 @@ func upstream(t *testing.T, got chan<- seen) *httptest.Server {
 // testID is a complete identity for tests that do not look at it.
 var testID = Identity{Pipeline: "p", RunID: 1}
 
-// mustOpen opens a session or fails the test at setup.
+// mustOpen opens a session or fails the test at setup; the session is
+// closed when the test ends however it ends (Close is idempotent).
 func mustOpen(t *testing.T, g *Gateway, token string) *Session {
 	t.Helper()
 	s, err := g.Open(token, testID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { s.Close() })
 	return s
 }
 
@@ -137,15 +139,8 @@ func TestGatewaySessionsAreIndependent(t *testing.T) {
 	g := newGateway(t, addr, up.URL)
 	t1, _ := NewToken()
 	t2, _ := NewToken()
-	s1, err := g.Open(t1, testID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s2, err := g.Open(t2, testID)
-	if err != nil {
-		t.Fatalf("second concurrent session: %v", err)
-	}
-	defer s2.Close()
+	s1 := mustOpen(t, g, t1)
+	s2 := mustOpen(t, g, t2)
 	for _, tok := range []string{t1, t2} {
 		resp := post(t, addr, tok)
 		io.Copy(io.Discard, resp.Body)
@@ -169,7 +164,8 @@ func TestGatewaySessionsAreIndependent(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("other session after a close: status %d, want 200", resp.StatusCode)
 	}
-	if _, err := g.Open(t2, testID); err == nil {
+	if dup, err := g.Open(t2, testID); err == nil {
+		dup.Close()
 		t.Error("the same token opened twice")
 	}
 }
@@ -232,10 +228,7 @@ func TestGatewayHoldsThePortOnlyWhileSessionsAreOpen(t *testing.T) {
 	g := newGateway(t, addr, "http://127.0.0.1:1")
 	t1, _ := NewToken()
 	t2, _ := NewToken()
-	s1, err := g.Open(t1, testID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s1 := mustOpen(t, g, t1)
 	s2 := mustOpen(t, g, t2)
 	s1.Close()
 	if c, err := net.DialTimeout("tcp", addr, time.Second); err != nil {
@@ -480,8 +473,13 @@ func TestBindErrorKeepsBothHints(t *testing.T) {
 	}
 	defer held.Close()
 	g := newGateway(t, held.Addr().String(), "http://127.0.0.1:1")
-	if g.PortRisk() == "" {
-		t.Skip("kernel port settings unreadable here")
+	// Eligibility is decided without the code under test: a kernel-chosen
+	// port is in the ephemeral range and never a reserved one.
+	if _, err := os.ReadFile(filepath.Join(procIPv4, "ip_local_port_range")); err != nil {
+		t.Skip("kernel port settings unreadable here:", err)
+	}
+	if _, err := os.ReadFile(filepath.Join(procIPv4, "ip_local_reserved_ports")); err != nil {
+		t.Skip("kernel port settings unreadable here:", err)
 	}
 	token, _ := NewToken()
 	_, err = g.Open(token, testID)
