@@ -372,11 +372,18 @@ func TestSandboxdCleanupIgnoresOtherResources(t *testing.T) {
 }
 
 // Two agent attempts run at once through one run gateway: each guest's own
-// token reaches the model while the other attempt is still running.
+// token reaches the model while the other attempt is still running, and each
+// model call arrives upstream named by its own attempt's run, whatever the
+// guest claims (gitmoot/stagehand#48).
 func TestSandboxdConcurrentAttemptsShareTheGateway(t *testing.T) {
 	f, be, addr := newFake(t)
 	f.ompLines = []string{msg(`{"ok":true}`, 0.1), end}
+	var idMu sync.Mutex
+	var identities []string
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		idMu.Lock()
+		identities = append(identities, r.Header.Get(modelgw.HeaderPipeline)+"/"+r.Header.Get(modelgw.HeaderRun))
+		idMu.Unlock()
 		io.WriteString(w, `{"ok":true}`)
 	}))
 	t.Cleanup(up.Close)
@@ -410,6 +417,8 @@ func TestSandboxdConcurrentAttemptsShareTheGateway(t *testing.T) {
 		}
 		req, _ := http.NewRequest("POST", "http://"+addr+"/v1/messages", strings.NewReader("{}"))
 		req.Header.Set("X-Api-Key", fmt.Sprint(env["ANTHROPIC_API_KEY"]))
+		req.Header.Set(modelgw.HeaderPipeline, "dossier-research") // a guest's claim
+		req.Header.Set(modelgw.HeaderRun, "1")
 		code := 0
 		if resp, err := http.DefaultClient.Do(req); err == nil {
 			code = resp.StatusCode
@@ -425,7 +434,9 @@ func TestSandboxdConcurrentAttemptsShareTheGateway(t *testing.T) {
 		done.Add(1)
 		go func() {
 			defer done.Done()
-			results[i] = Executor{Backend: be}.Execute(context.Background(), newJob(t, 1))
+			job := newJob(t, 1)
+			job.Pipeline, job.RunID = fmt.Sprintf("p%d", i), int64(10+i)
+			results[i] = Executor{Backend: be}.Execute(context.Background(), job)
 		}()
 	}
 	finished := make(chan struct{})
@@ -445,6 +456,10 @@ func TestSandboxdConcurrentAttemptsShareTheGateway(t *testing.T) {
 	}
 	if len(statuses) != 2 || statuses[0] != 200 || statuses[1] != 200 {
 		t.Errorf("model calls during overlap: %v; want both 200", statuses)
+	}
+	slices.Sort(identities)
+	if !slices.Equal(identities, []string{"p0/10", "p1/11"}) {
+		t.Errorf("upstream saw identities %q; want each attempt's own run, never the guest's claim", identities)
 	}
 	if f.liveCount() != 0 {
 		t.Errorf("%d VMs left", f.liveCount())

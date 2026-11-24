@@ -23,11 +23,45 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// Identity names the run an agent attempt belongs to. The run gateway sends
+// it upstream with every model call of that attempt, as HeaderPipeline and
+// HeaderRun, so a proxy further up can route or meter by pipeline
+// (gitmoot/stagehand#48).
+type Identity struct {
+	Pipeline string
+	RunID    int64
+}
+
+// The run gateway's identity headers. A guest cannot set them: every header
+// it sends under identityPrefix is dropped before these are set.
+const (
+	HeaderPipeline = "X-Stagehand-Pipeline"
+	HeaderRun      = "X-Stagehand-Run"
+	identityPrefix = "X-Stagehand-"
+)
+
+// setIdentity drops every X-Stagehand-* header, in any letter case, then
+// sets id's headers. An empty Pipeline or a zero RunID sets nothing.
+func setIdentity(h http.Header, id Identity) {
+	for k := range h {
+		if len(k) >= len(identityPrefix) && strings.EqualFold(k[:len(identityPrefix)], identityPrefix) {
+			delete(h, k)
+		}
+	}
+	if id.Pipeline != "" {
+		h.Set(HeaderPipeline, id.Pipeline)
+	}
+	if id.RunID > 0 {
+		h.Set(HeaderRun, strconv.FormatInt(id.RunID, 10))
+	}
+}
 
 // credentialHeaders are stripped from every request before it is forwarded.
 var credentialHeaders = []string{"Authorization", "X-Api-Key", "Proxy-Authorization", "Cookie"}
@@ -102,6 +136,7 @@ type Gateway struct {
 }
 
 type session struct {
+	id     Identity
 	served atomic.Int64
 	ctx    context.Context // cancelled when the session closes
 	cancel context.CancelFunc
@@ -128,9 +163,10 @@ type Session struct {
 }
 
 // Open admits token until the returned session is closed, binding the
-// listener if no other session holds it. Tokens are compared by their
-// SHA-256, so the lookup leaks nothing about a valid token's bytes.
-func (g *Gateway) Open(token string) (*Session, error) {
+// listener if no other session holds it. Every call it forwards carries id
+// upstream. Tokens are compared by their SHA-256, so the lookup leaks
+// nothing about a valid token's bytes.
+func (g *Gateway) Open(token string, id Identity) (*Session, error) {
 	if len(token) < 32 {
 		return nil, errors.New("run gateway: token too short")
 	}
@@ -143,7 +179,7 @@ func (g *Gateway) Open(token string) (*Session, error) {
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &session{ctx: ctx, cancel: cancel}
+	s := &session{id: id, ctx: ctx, cancel: cancel}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if _, dup := g.sessions[key]; dup {
@@ -160,7 +196,11 @@ func (g *Gateway) bind() error {
 	if err != nil {
 		return fmt.Errorf("run gateway: %w (is another runner using this sandboxd instance?)", err)
 	}
-	proxy := newProxy(g.up, nil)
+	// The identity comes from the session the token opened, never from the
+	// guest's request.
+	proxy := newProxy(g.up, func(out *http.Request) {
+		setIdentity(out.Header, out.Context().Value(identityKey{}).(Identity))
+	})
 	srv := &http.Server{
 		ReadHeaderTimeout: 10 * time.Second,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -181,7 +221,7 @@ func (g *Gateway) bind() error {
 			defer cancel()
 			stop := context.AfterFunc(s.ctx, cancel)
 			defer stop()
-			proxy.ServeHTTP(w, r.WithContext(ctx))
+			proxy.ServeHTTP(w, r.WithContext(context.WithValue(ctx, identityKey{}, s.id)))
 		}),
 	}
 	done := make(chan struct{})
@@ -244,6 +284,10 @@ type CredentialProxy struct {
 	Upstream  *url.URL
 	Log       *slog.Logger
 }
+
+// identityKey carries a session's Identity from the handler to the proxy's
+// Rewrite.
+type identityKey struct{}
 
 // tokenKey carries the bearer token from the handler to the proxy's Rewrite.
 type tokenKey struct{}
