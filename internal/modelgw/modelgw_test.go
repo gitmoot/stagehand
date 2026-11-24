@@ -399,3 +399,38 @@ func equalHeaders(a, b map[string][]string) bool {
 	}
 	return true
 }
+
+// A gateway port the kernel may hand out as a client source port is
+// reported, unless it is reserved; anything unreadable reports nothing.
+func TestPortRisk(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if r := portRisk(dir, 43293); r != "" {
+		t.Errorf("no kernel settings: %q", r)
+	}
+	write("ip_local_port_range", "32768\t60999\n")
+	write("ip_local_reserved_ports", "\n")
+	for _, c := range []struct {
+		reserved string
+		port     int
+		risky    bool
+	}{
+		{"", 43293, true},
+		{"", 8797, false},  // below the range
+		{"", 61000, false}, // above it
+		{"43293,43295", 43293, false},
+		{"43295", 43293, true},
+		{"8000,43290-43299", 43293, false},
+		{"43294-43299", 43293, true},
+	} {
+		write("ip_local_reserved_ports", c.reserved+"\n")
+		if r := portRisk(dir, c.port); (r != "") != c.risky {
+			t.Errorf("reserved %q, port %d: %q, want risky=%v", c.reserved, c.port, r, c.risky)
+		}
+	}
+}

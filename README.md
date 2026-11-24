@@ -143,6 +143,11 @@ uid 1000), and the VM is destroyed afterwards.
   passes both through, so a proxy on either side of it can route or meter by pipeline, for example
   by sending one pipeline to a different provider key. The headers reach the provider unless such
   a proxy removes them. The `local` executor has no run gateway and sends no identity.
+- **Reserve the gateway port** when it lies in the kernel's ephemeral range (Linux default
+  32768-60999): the run gateway binds only while an agent stage runs, and in between any local
+  client may be handed the port as its source port, which makes the next agent stage fail with
+  `bind: address already in use`. Add it to `net.ipv4.ip_local_reserved_ports` (with the
+  `gateway-proxy` port), for example in `/etc/sysctl.d/`. `serve` warns at start when it isn't.
 - **Credentials:** the real model credential is added further along, by
   `stagehand gateway-proxy`, on the host that holds the omp auth-gateway token.
 - **Where things run:** the runner (and so the shell stages) runs next to the data its shell

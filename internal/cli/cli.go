@@ -171,6 +171,7 @@ type app struct {
 	home   string
 	store  *store.Store
 	engine *engine.Engine
+	gw     *modelgw.Gateway // the sandboxd executor's run gateway, else nil
 	stdout io.Writer
 	stderr io.Writer
 	log    *slog.Logger
@@ -222,6 +223,7 @@ func open(ctx context.Context, home, configPath string, stderr io.Writer) (*app,
 	}
 	log := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	executors := map[spec.Kind]stage.Executor{spec.KindShell: shellexec.Executor{}}
+	var gateway *modelgw.Gateway
 	switch cfg.Agent.Executor {
 	case config.ExecutorLocal:
 		executors[spec.KindAgent] = agentexec.Executor{Backend: agentexec.Local{
@@ -241,6 +243,7 @@ func open(ctx context.Context, home, configPath string, stderr io.Writer) (*app,
 			st.Close()
 			return nil, err
 		}
+		gateway = gw
 		executors[spec.KindAgent] = agentexec.Executor{Backend: agentexec.Sandboxd{
 			Client:          &sandboxd.Client{BaseURL: strings.TrimRight(sc.URL, "/"), APIKey: key},
 			Template:        sc.Template,
@@ -254,7 +257,7 @@ func open(ctx context.Context, home, configPath string, stderr io.Writer) (*app,
 	}
 	eng := engine.New(st, home, executors, baseEnv(), log)
 	eng.UsageLimitWait = time.Duration(cfg.Agent.UsageLimitWait)
-	return &app{cfg: cfg, home: home, store: st, engine: eng, stderr: stderr, log: log}, nil
+	return &app{cfg: cfg, home: home, store: st, engine: eng, gw: gateway, stderr: stderr, log: log}, nil
 }
 
 func (a *app) close() { _ = a.store.Close() }
@@ -783,6 +786,11 @@ func (a *app) serve(ctx context.Context, args []string) error {
 	}
 	a.engine.Poll = *poll
 	a.log.Info("serving", "home", a.home, "version", buildinfo.String())
+	if a.gw != nil {
+		if risk := a.gw.PortRisk(); risk != "" {
+			a.log.Warn("run gateway: agent stages may fail to start", "reason", risk)
+		}
+	}
 	err = a.engine.Loop(ctx, engine.LoopOptions{Schedule: true})
 	if errors.Is(err, context.Canceled) {
 		a.log.Info("stopped")
