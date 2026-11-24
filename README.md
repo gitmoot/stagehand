@@ -137,6 +137,12 @@ uid 1000), and the VM is destroyed afterwards.
 - **Model calls:** the guest's omp sends them to `http://10.0.2.2:<host-port>`, the only host port
   a sandboxd instance exposes. There, stagehand runs a **run gateway** for the length of the
   attempt. It accepts only that attempt's random token, removes it, and forwards the call.
+- **Run identity:** every call the run gateway forwards carries `X-Stagehand-Pipeline: <pipeline>`
+  and `X-Stagehand-Run: <run id>`, taken from the attempt the token belongs to. Any `X-Stagehand-*`
+  header the guest sent is dropped first, so a guest cannot claim another pipeline. `gateway-proxy`
+  passes both through, so a proxy on either side of it can route or meter by pipeline, for example
+  by sending one pipeline to a different provider key. The headers reach the provider unless such
+  a proxy removes them. The `local` executor has no run gateway and sends no identity.
 - **Credentials:** the real model credential is added further along, by
   `stagehand gateway-proxy`, on the host that holds the omp auth-gateway token.
 - **Where things run:** the runner (and so the shell stages) runs next to the data its shell

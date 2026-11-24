@@ -35,6 +35,10 @@ type Request struct {
 	Release func(resource string)
 	// Stderr receives omp's stderr and backend diagnostics.
 	Stderr io.Writer
+	// Pipeline and RunID name the attempt's run. The sandboxd backend
+	// sends them upstream with every model call (modelgw.Identity).
+	Pipeline string
+	RunID    int64
 }
 
 // Backend runs omp somewhere and streams its stdout, line by line, to
@@ -120,7 +124,7 @@ func (x Executor) Execute(ctx context.Context, job stage.Job) stage.Result {
 			cancel(errOverBudget{spent: spent, limit: st.MaxCost})
 		}
 	}
-	exitCode, runErr := x.Backend.Run(runCtx, Request{Files: files, Args: args, Track: job.Track, Release: job.Release, Stderr: logf}, onLine)
+	exitCode, runErr := x.Backend.Run(runCtx, Request{Files: files, Args: args, Track: job.Track, Release: job.Release, Stderr: logf, Pipeline: job.Pipeline, RunID: job.RunID}, onLine)
 
 	mu.Lock()
 	defer mu.Unlock()

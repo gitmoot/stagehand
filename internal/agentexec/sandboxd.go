@@ -65,7 +65,7 @@ func (s Sandboxd) Run(ctx context.Context, req Request, onLine func([]byte)) (in
 	if err != nil {
 		return 0, err
 	}
-	gw, err := s.Gateway.Open(token)
+	gw, err := s.Gateway.Open(token, modelgw.Identity{Pipeline: req.Pipeline, RunID: req.RunID})
 	if err != nil {
 		return 0, err
 	}
