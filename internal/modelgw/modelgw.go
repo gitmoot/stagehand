@@ -59,12 +59,13 @@ func dropIdentity(h http.Header) {
 }
 
 // setIdentity drops every X-Stagehand-* header and request trailer the guest
-// sent (a trailer would reach upstream too), then sets id's headers.
-func setIdentity(out *http.Request, id Identity) {
+// sent (a trailer would reach upstream too), then sets the session's
+// pipeline and run headers.
+func setIdentity(out *http.Request, pipeline, run string) {
 	dropIdentity(out.Header)
 	dropIdentity(out.Trailer)
-	out.Header.Set(HeaderPipeline, id.Pipeline)
-	out.Header.Set(HeaderRun, strconv.FormatInt(id.RunID, 10))
+	out.Header.Set(HeaderPipeline, pipeline)
+	out.Header.Set(HeaderRun, run)
 }
 
 // credentialHeaders are stripped from every request before it is forwarded.
@@ -168,8 +169,9 @@ type Session struct {
 
 // Open admits token until the returned session is closed, binding the
 // listener if no other session holds it. Every call it forwards carries id
-// upstream. Tokens are compared by their SHA-256, so the lookup leaks
-// nothing about a valid token's bytes.
+// upstream. id must be complete: a non-empty Pipeline and a positive RunID;
+// Open refuses anything else. Tokens are compared by their SHA-256, so the
+// lookup leaks nothing about a valid token's bytes.
 func (g *Gateway) Open(token string, id Identity) (*Session, error) {
 	if len(token) < 32 {
 		return nil, errors.New("run gateway: token too short")
@@ -188,7 +190,8 @@ func (g *Gateway) Open(token string, id Identity) (*Session, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	// The identity comes from the session the token opened, never from the
 	// guest's request.
-	proxy := newProxy(g.up, func(out *http.Request) { setIdentity(out, id) })
+	run := strconv.FormatInt(id.RunID, 10)
+	proxy := newProxy(g.up, func(out *http.Request) { setIdentity(out, id.Pipeline, run) })
 	s := &session{proxy: proxy, ctx: ctx, cancel: cancel}
 	g.mu.Lock()
 	defer g.mu.Unlock()
