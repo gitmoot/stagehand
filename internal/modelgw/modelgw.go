@@ -207,10 +207,12 @@ func (g *Gateway) Open(token string, id Identity) (*Session, error) {
 func (g *Gateway) bind() error {
 	ln, err := net.Listen("tcp", g.listen)
 	if err != nil {
+		// Reservation can't tell who holds the port: keep the competing-
+		// listener hint and add the source-port one when it applies.
 		hint := "is another runner using this sandboxd instance?"
 		if errors.Is(err, syscall.EADDRINUSE) {
 			if risk := g.PortRisk(); risk != "" {
-				hint = risk
+				hint += " Or " + risk
 			}
 		}
 		return fmt.Errorf("run gateway: %w (%s)", err, hint)
@@ -254,15 +256,17 @@ func (g *Gateway) bind() error {
 // local client as its source port, and the next bind fails with EADDRINUSE
 // (gitmoot/stagehand#51).
 func (g *Gateway) PortRisk() string {
-	_, p, err := net.SplitHostPort(g.listen)
+	return listenRisk("/proc/sys/net/ipv4", g.listen)
+}
+
+// listenRisk resolves listen the way net.Listen does (a service name
+// included) and checks its port.
+func listenRisk(dir, listen string) string {
+	a, err := net.ResolveTCPAddr("tcp", listen)
 	if err != nil {
 		return ""
 	}
-	port, err := strconv.Atoi(p)
-	if err != nil {
-		return ""
-	}
-	return portRisk("/proc/sys/net/ipv4", port)
+	return portRisk(dir, a.Port)
 }
 
 func portRisk(dir string, port int) string {
