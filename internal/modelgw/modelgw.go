@@ -23,10 +23,12 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -202,7 +204,13 @@ func (g *Gateway) Open(token string, id Identity) (*Session, error) {
 func (g *Gateway) bind() error {
 	ln, err := net.Listen("tcp", g.listen)
 	if err != nil {
-		return fmt.Errorf("run gateway: %w (is another runner using this sandboxd instance?)", err)
+		hint := "is another runner using this sandboxd instance?"
+		if errors.Is(err, syscall.EADDRINUSE) {
+			if risk := g.PortRisk(); risk != "" {
+				hint = risk
+			}
+		}
+		return fmt.Errorf("run gateway: %w (%s)", err, hint)
 	}
 	// The identity comes from the session the token opened, never from the
 	// guest's request.
@@ -239,6 +247,51 @@ func (g *Gateway) bind() error {
 	}()
 	g.srv, g.ln, g.done = srv, ln, done
 	return nil
+}
+
+// PortRisk explains why the listen port can be taken from under the
+// gateway, or returns "" when it cannot (or the kernel settings can't be
+// read). The gateway binds only while an agent stage runs; a port inside the
+// kernel's ephemeral range and not reserved may meanwhile be handed to any
+// local client as its source port, and the next bind fails with EADDRINUSE
+// (gitmoot/stagehand#51).
+func (g *Gateway) PortRisk() string {
+	_, p, err := net.SplitHostPort(g.listen)
+	if err != nil {
+		return ""
+	}
+	port, err := strconv.Atoi(p)
+	if err != nil {
+		return ""
+	}
+	return portRisk("/proc/sys/net/ipv4", port)
+}
+
+func portRisk(dir string, port int) string {
+	raw, err := os.ReadFile(filepath.Join(dir, "ip_local_port_range"))
+	if err != nil {
+		return ""
+	}
+	var lo, hi int
+	if _, err := fmt.Sscan(string(raw), &lo, &hi); err != nil || port < lo || port > hi {
+		return ""
+	}
+	raw, err = os.ReadFile(filepath.Join(dir, "ip_local_reserved_ports"))
+	if err != nil {
+		return ""
+	}
+	for _, item := range strings.Split(strings.TrimSpace(string(raw)), ",") {
+		a, b, isRange := strings.Cut(item, "-")
+		first, err1 := strconv.Atoi(a)
+		last, err2 := first, error(nil)
+		if isRange {
+			last, err2 = strconv.Atoi(b)
+		}
+		if err1 == nil && err2 == nil && first <= port && port <= last {
+			return ""
+		}
+	}
+	return fmt.Sprintf("port %d is in the kernel's ephemeral range %d-%d and not reserved, so a local client may hold it as its source port; add it to net.ipv4.ip_local_reserved_ports", port, lo, hi)
 }
 
 // release stops the listener; g.life is held. The port is free when it
