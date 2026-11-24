@@ -47,14 +47,22 @@ const (
 	identityPrefix = "X-Stagehand-"
 )
 
-// setIdentity drops every X-Stagehand-* header, in any letter case, then
-// sets id's headers. An empty Pipeline or a zero RunID sets nothing.
-func setIdentity(h http.Header, id Identity) {
+// dropIdentity deletes every X-Stagehand-* key, in any letter case.
+func dropIdentity(h http.Header) {
 	for k := range h {
 		if len(k) >= len(identityPrefix) && strings.EqualFold(k[:len(identityPrefix)], identityPrefix) {
 			delete(h, k)
 		}
 	}
+}
+
+// setIdentity drops every X-Stagehand-* header and request trailer the guest
+// sent (a trailer would reach upstream too), then sets id's headers. An
+// empty Pipeline or a zero RunID sets nothing.
+func setIdentity(out *http.Request, id Identity) {
+	h := out.Header
+	dropIdentity(h)
+	dropIdentity(out.Trailer)
 	if id.Pipeline != "" {
 		h.Set(HeaderPipeline, id.Pipeline)
 	}
@@ -199,7 +207,7 @@ func (g *Gateway) bind() error {
 	// The identity comes from the session the token opened, never from the
 	// guest's request.
 	proxy := newProxy(g.up, func(out *http.Request) {
-		setIdentity(out.Header, out.Context().Value(identityKey{}).(Identity))
+		setIdentity(out, out.Context().Value(identityKey{}).(Identity))
 	})
 	srv := &http.Server{
 		ReadHeaderTimeout: 10 * time.Second,

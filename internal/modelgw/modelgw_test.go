@@ -305,7 +305,12 @@ func TestGatewayPortIsFreeRightAfterLastClose(t *testing.T) {
 func TestGatewaySendsSessionIdentityNotTheGuests(t *testing.T) {
 	got := make(chan http.Header, 4)
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got <- r.Header.Clone()
+		io.Copy(io.Discard, r.Body)
+		h := r.Header.Clone()
+		for k, v := range r.Trailer { // a trailer counts as a header here
+			h[k] = append(h[k], v...)
+		}
+		got <- h
 	}))
 	defer up.Close()
 	upURL, _ := url.Parse(up.URL)
@@ -329,12 +334,16 @@ func TestGatewaySendsSessionIdentityNotTheGuests(t *testing.T) {
 	}
 	defer s2.Close()
 
-	send := func(token string, forged map[string][]string) http.Header {
+	send := func(token string, forged, trailer map[string][]string) http.Header {
 		t.Helper()
 		req, _ := http.NewRequest("POST", "http://"+addr+"/v1/messages", strings.NewReader("{}"))
 		req.Header.Set("X-Api-Key", token)
 		for k, v := range forged {
 			req.Header[k] = v // as written, not canonicalised
+		}
+		if trailer != nil {
+			req.Body, req.ContentLength = io.NopCloser(strings.NewReader("{}")), -1 // chunked
+			req.Trailer = trailer
 		}
 		resp, err := (&http.Client{Transport: &http.Transport{DisableKeepAlives: true}}).Do(req)
 		if err != nil {
@@ -360,20 +369,21 @@ func TestGatewaySendsSessionIdentityNotTheGuests(t *testing.T) {
 		return map[string][]string{HeaderPipeline: {pipeline}, HeaderRun: {run}}
 	}
 
-	// The canary's guest claims to be dossier-research, in several spellings.
+	// The canary's guest claims to be dossier-research, in several spellings
+	// and in a request trailer.
 	h := send(t2, map[string][]string{
 		"X-Stagehand-Pipeline": {"dossier-research", "dossier-research-b"},
 		"x-stagehand-run":      {"41"},
 		"X-STAGEHAND-EVENT-ID": {"forged"},
 		"X-Stagehand-Anything": {"x"},
-	})
+	}, map[string][]string{"X-Stagehand-Pipeline": {"dossier-research"}, "X-Stagehand-Trailer": {"x"}})
 	if got, w := stagehand(h), want("canary", "7"); !equalHeaders(got, w) {
 		t.Errorf("forging guest: upstream saw %v, want %v", got, w)
 	}
 	if h.Get("Authorization") != "Bearer real-gateway-token" {
 		t.Errorf("gateway-proxy credential missing: %q", h.Get("Authorization"))
 	}
-	if got, w := stagehand(send(t1, nil)), want("dossier-research", "41"); !equalHeaders(got, w) {
+	if got, w := stagehand(send(t1, nil, nil)), want("dossier-research", "41"); !equalHeaders(got, w) {
 		t.Errorf("plain guest: upstream saw %v, want %v", got, w)
 	}
 }
