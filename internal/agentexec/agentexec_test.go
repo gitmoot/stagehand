@@ -56,8 +56,10 @@ func newJob(t *testing.T, maxCost float64) stage.Job {
 	return stage.Job{
 		Stage: spec.Stage{ID: "research", Agent: "omp", Prompt: "Decide each row.", Inputs: []string{"rows.json"},
 			Output: "decisions.json", MaxCost: maxCost, Timeout: "10m", Tools: []string{"read", "web_search"}},
-		WorkDir: dir,
-		LogPath: filepath.Join(dir, "research.log"),
+		RunID:    1,
+		Pipeline: "pipe",
+		WorkDir:  dir,
+		LogPath:  filepath.Join(dir, "research.log"),
 	}
 }
 

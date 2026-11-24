@@ -3,12 +3,14 @@ package modelgw
 import (
 	"bufio"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +35,9 @@ func upstream(t *testing.T, got chan<- seen) *httptest.Server {
 	t.Cleanup(srv.Close)
 	return srv
 }
+
+// testID is a complete identity for tests that do not look at it.
+var testID = Identity{Pipeline: "p", RunID: 1}
 
 func freeAddr(t *testing.T) string {
 	t.Helper()
@@ -76,7 +81,7 @@ func TestGatewayAdmitsOnlyOpenTokensAndStripsThem(t *testing.T) {
 	token, _ := NewToken()
 	addr := freeAddr(t)
 	g := newGateway(t, addr, up.URL)
-	sess, err := g.Open(token, Identity{})
+	sess, err := g.Open(token, testID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,11 +127,11 @@ func TestGatewaySessionsAreIndependent(t *testing.T) {
 	g := newGateway(t, addr, up.URL)
 	t1, _ := NewToken()
 	t2, _ := NewToken()
-	s1, err := g.Open(t1, Identity{})
+	s1, err := g.Open(t1, testID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s2, err := g.Open(t2, Identity{})
+	s2, err := g.Open(t2, testID)
 	if err != nil {
 		t.Fatalf("second concurrent session: %v", err)
 	}
@@ -154,7 +159,7 @@ func TestGatewaySessionsAreIndependent(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("other session after a close: status %d, want 200", resp.StatusCode)
 	}
-	if _, err := g.Open(t2, Identity{}); err == nil {
+	if _, err := g.Open(t2, testID); err == nil {
 		t.Error("the same token opened twice")
 	}
 }
@@ -179,8 +184,8 @@ func TestGatewayCloseCutsOnlyItsOwnStreams(t *testing.T) {
 	g := newGateway(t, addr, up.URL)
 	t1, _ := NewToken()
 	t2, _ := NewToken()
-	s1, _ := g.Open(t1, Identity{})
-	s2, _ := g.Open(t2, Identity{})
+	s1, _ := g.Open(t1, testID)
+	s2, _ := g.Open(t2, testID)
 	defer s2.Close()
 	r1, r2 := post(t, addr, t1), post(t, addr, t2)
 	defer r1.Body.Close()
@@ -217,11 +222,11 @@ func TestGatewayHoldsThePortOnlyWhileSessionsAreOpen(t *testing.T) {
 	g := newGateway(t, addr, "http://127.0.0.1:1")
 	t1, _ := NewToken()
 	t2, _ := NewToken()
-	s1, err := g.Open(t1, Identity{})
+	s1, err := g.Open(t1, testID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s2, _ := g.Open(t2, Identity{})
+	s2, _ := g.Open(t2, testID)
 	s1.Close()
 	if c, err := net.DialTimeout("tcp", addr, time.Second); err != nil {
 		t.Fatal("port released while a session is still open")
@@ -238,9 +243,9 @@ func TestGatewayHoldsThePortOnlyWhileSessionsAreOpen(t *testing.T) {
 	}
 	// A port someone else holds is reported, not silently shared.
 	other := newGateway(t, addr, "http://127.0.0.1:1")
-	held, _ := other.Open(t1, Identity{})
+	held, _ := other.Open(t1, testID)
 	defer held.Close()
-	if _, err := g.Open(t2, Identity{}); err == nil {
+	if _, err := g.Open(t2, testID); err == nil {
 		t.Error("two gateways bound one address")
 	}
 }
@@ -250,7 +255,9 @@ func TestCredentialProxyReplacesCredentials(t *testing.T) {
 	up := upstream(t, got)
 	u, _ := url.Parse(up.URL)
 	tokenFile := filepath.Join(t.TempDir(), "gw.token")
-	os.WriteFile(tokenFile, []byte("real-gateway-token\n"), 0o600)
+	if err := os.WriteFile(tokenFile, []byte("real-gateway-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	srv := httptest.NewServer(CredentialProxy{TokenFile: tokenFile, Upstream: u}.Handler())
 	defer srv.Close()
 
@@ -268,7 +275,9 @@ func TestCredentialProxyReplacesCredentials(t *testing.T) {
 		t.Errorf("upstream saw %+v", s)
 	}
 
-	os.Chmod(tokenFile, 0o644)
+	if err := os.Chmod(tokenFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	resp, err = http.Post(srv.URL+"/v1/messages", "application/json", strings.NewReader("{}"))
 	if err != nil {
 		t.Fatal(err)
@@ -286,7 +295,7 @@ func TestGatewayPortIsFreeRightAfterLastClose(t *testing.T) {
 	g := newGateway(t, addr, "http://127.0.0.1:1")
 	for i := range 300 {
 		token, _ := NewToken()
-		s, err := g.Open(token, Identity{})
+		s, err := g.Open(token, testID)
 		if err != nil {
 			t.Fatalf("iteration %d: %v", i, err)
 		}
@@ -303,19 +312,18 @@ func TestGatewayPortIsFreeRightAfterLastClose(t *testing.T) {
 // through gateway-proxy, and nothing a guest sent under X-Stagehand-*
 // (gitmoot/stagehand#48).
 func TestGatewaySendsSessionIdentityNotTheGuests(t *testing.T) {
-	got := make(chan http.Header, 4)
+	type call struct{ header, trailer http.Header }
+	got := make(chan call, 4)
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		h := r.Header.Clone()
-		for k, v := range r.Trailer { // a trailer counts as a header here
-			h[k] = append(h[k], v...)
-		}
-		got <- h
+		io.Copy(io.Discard, r.Body) // trailers arrive after the body
+		got <- call{r.Header.Clone(), r.Trailer.Clone()}
 	}))
 	defer up.Close()
 	upURL, _ := url.Parse(up.URL)
 	tokenFile := filepath.Join(t.TempDir(), "gw.token")
-	os.WriteFile(tokenFile, []byte("real-gateway-token\n"), 0o600)
+	if err := os.WriteFile(tokenFile, []byte("real-gateway-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cp := httptest.NewServer(CredentialProxy{TokenFile: tokenFile, Upstream: upURL}.Handler())
 	defer cp.Close()
 
@@ -334,7 +342,7 @@ func TestGatewaySendsSessionIdentityNotTheGuests(t *testing.T) {
 	}
 	defer s2.Close()
 
-	send := func(token string, forged, trailer map[string][]string) http.Header {
+	send := func(token string, forged, trailer map[string][]string) call {
 		t.Helper()
 		req, _ := http.NewRequest("POST", "http://"+addr+"/v1/messages", strings.NewReader("{}"))
 		req.Header.Set("X-Api-Key", token)
@@ -377,27 +385,32 @@ func TestGatewaySendsSessionIdentityNotTheGuests(t *testing.T) {
 		"X-STAGEHAND-EVENT-ID": {"forged"},
 		"X-Stagehand-Anything": {"x"},
 	}, map[string][]string{"X-Stagehand-Pipeline": {"dossier-research"}, "X-Stagehand-Trailer": {"x"}})
-	if got, w := stagehand(h), want("canary", "7"); !equalHeaders(got, w) {
-		t.Errorf("forging guest: upstream saw %v, want %v", got, w)
+	if got, w := stagehand(h.header), want("canary", "7"); !maps.EqualFunc(got, w, slices.Equal) {
+		t.Errorf("forging guest: upstream headers %v, want %v", got, w)
 	}
-	if h.Get("Authorization") != "Bearer real-gateway-token" {
-		t.Errorf("gateway-proxy credential missing: %q", h.Get("Authorization"))
+	// A trailer name alone (declared, with no value) is already a leak.
+	if got := stagehand(h.trailer); len(got) != 0 {
+		t.Errorf("forging guest: upstream trailers %v, want none", got)
 	}
-	if got, w := stagehand(send(t1, nil, nil)), want("dossier-research", "41"); !equalHeaders(got, w) {
-		t.Errorf("plain guest: upstream saw %v, want %v", got, w)
+	if h.header.Get("Authorization") != "Bearer real-gateway-token" {
+		t.Errorf("gateway-proxy credential missing: %q", h.header.Get("Authorization"))
+	}
+	if got, w := stagehand(send(t1, nil, nil).header), want("dossier-research", "41"); !maps.EqualFunc(got, w, slices.Equal) {
+		t.Errorf("plain guest: upstream headers %v, want %v", got, w)
 	}
 }
 
-func equalHeaders(a, b map[string][]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if strings.Join(v, "\x00") != strings.Join(b[k], "\x00") {
-			return false
+// A session without a complete identity would forward unlabelled calls, which
+// an upstream router would treat as some default; Open refuses it instead.
+func TestGatewayRefusesIncompleteIdentity(t *testing.T) {
+	g := newGateway(t, freeAddr(t), "http://127.0.0.1:1")
+	for _, id := range []Identity{{}, {Pipeline: "p"}, {RunID: 1}, {Pipeline: "p", RunID: -1}} {
+		token, _ := NewToken()
+		if s, err := g.Open(token, id); err == nil {
+			s.Close()
+			t.Errorf("Open accepted %+v", id)
 		}
 	}
-	return true
 }
 
 // A gateway port the kernel may hand out as a client source port is

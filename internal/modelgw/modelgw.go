@@ -59,18 +59,12 @@ func dropIdentity(h http.Header) {
 }
 
 // setIdentity drops every X-Stagehand-* header and request trailer the guest
-// sent (a trailer would reach upstream too), then sets id's headers. An
-// empty Pipeline or a zero RunID sets nothing.
+// sent (a trailer would reach upstream too), then sets id's headers.
 func setIdentity(out *http.Request, id Identity) {
-	h := out.Header
-	dropIdentity(h)
+	dropIdentity(out.Header)
 	dropIdentity(out.Trailer)
-	if id.Pipeline != "" {
-		h.Set(HeaderPipeline, id.Pipeline)
-	}
-	if id.RunID > 0 {
-		h.Set(HeaderRun, strconv.FormatInt(id.RunID, 10))
-	}
+	out.Header.Set(HeaderPipeline, id.Pipeline)
+	out.Header.Set(HeaderRun, strconv.FormatInt(id.RunID, 10))
 }
 
 // credentialHeaders are stripped from every request before it is forwarded.
@@ -146,7 +140,7 @@ type Gateway struct {
 }
 
 type session struct {
-	id     Identity
+	proxy  *httputil.ReverseProxy // forwards with this session's identity
 	served atomic.Int64
 	ctx    context.Context // cancelled when the session closes
 	cancel context.CancelFunc
@@ -180,6 +174,9 @@ func (g *Gateway) Open(token string, id Identity) (*Session, error) {
 	if len(token) < 32 {
 		return nil, errors.New("run gateway: token too short")
 	}
+	if id.Pipeline == "" || id.RunID <= 0 {
+		return nil, fmt.Errorf("run gateway: incomplete identity %+v", id)
+	}
 	key := sha256.Sum256([]byte(token))
 	g.life.Lock()
 	defer g.life.Unlock()
@@ -189,7 +186,10 @@ func (g *Gateway) Open(token string, id Identity) (*Session, error) {
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &session{id: id, ctx: ctx, cancel: cancel}
+	// The identity comes from the session the token opened, never from the
+	// guest's request.
+	proxy := newProxy(g.up, func(out *http.Request) { setIdentity(out, id) })
+	s := &session{proxy: proxy, ctx: ctx, cancel: cancel}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if _, dup := g.sessions[key]; dup {
@@ -212,11 +212,6 @@ func (g *Gateway) bind() error {
 		}
 		return fmt.Errorf("run gateway: %w (%s)", err, hint)
 	}
-	// The identity comes from the session the token opened, never from the
-	// guest's request.
-	proxy := newProxy(g.up, func(out *http.Request) {
-		setIdentity(out, out.Context().Value(identityKey{}).(Identity))
-	})
 	srv := &http.Server{
 		ReadHeaderTimeout: 10 * time.Second,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -237,7 +232,7 @@ func (g *Gateway) bind() error {
 			defer cancel()
 			stop := context.AfterFunc(s.ctx, cancel)
 			defer stop()
-			proxy.ServeHTTP(w, r.WithContext(context.WithValue(ctx, identityKey{}, s.id)))
+			s.proxy.ServeHTTP(w, r.WithContext(ctx))
 		}),
 	}
 	done := make(chan struct{})
@@ -345,10 +340,6 @@ type CredentialProxy struct {
 	Upstream  *url.URL
 	Log       *slog.Logger
 }
-
-// identityKey carries a session's Identity from the handler to the proxy's
-// Rewrite.
-type identityKey struct{}
 
 // tokenKey carries the bearer token from the handler to the proxy's Rewrite.
 type tokenKey struct{}
