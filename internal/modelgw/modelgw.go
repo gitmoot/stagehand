@@ -210,9 +210,14 @@ func (g *Gateway) bind() error {
 		// Reservation can't tell who holds the port: keep the competing-
 		// listener hint and add the source-port one when it applies.
 		hint := "is another runner using this sandboxd instance?"
-		if errors.Is(err, syscall.EADDRINUSE) {
-			if risk := g.PortRisk(); risk != "" {
-				hint += " Or " + risk
+		// The port net.Listen actually tried, not a fresh resolution of the
+		// configured one.
+		var oe *net.OpError
+		if errors.Is(err, syscall.EADDRINUSE) && errors.As(err, &oe) {
+			if a, ok := oe.Addr.(*net.TCPAddr); ok {
+				if risk := portRisk(procIPv4, a.Port); risk != "" {
+					hint += " Or " + risk
+				}
 			}
 		}
 		return fmt.Errorf("run gateway: %w (%s)", err, hint)
@@ -256,8 +261,11 @@ func (g *Gateway) bind() error {
 // local client as its source port, and the next bind fails with EADDRINUSE
 // (gitmoot/stagehand#51).
 func (g *Gateway) PortRisk() string {
-	return listenRisk("/proc/sys/net/ipv4", g.listen)
+	return listenRisk(procIPv4, g.listen)
 }
+
+// procIPv4 holds the kernel's port settings.
+const procIPv4 = "/proc/sys/net/ipv4"
 
 // listenRisk resolves listen the way net.Listen does (a service name
 // included) and checks its port.
