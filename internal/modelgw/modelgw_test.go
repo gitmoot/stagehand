@@ -39,6 +39,16 @@ func upstream(t *testing.T, got chan<- seen) *httptest.Server {
 // testID is a complete identity for tests that do not look at it.
 var testID = Identity{Pipeline: "p", RunID: 1}
 
+// mustOpen opens a session or fails the test at setup.
+func mustOpen(t *testing.T, g *Gateway, token string) *Session {
+	t.Helper()
+	s, err := g.Open(token, testID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
 func freeAddr(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -184,8 +194,8 @@ func TestGatewayCloseCutsOnlyItsOwnStreams(t *testing.T) {
 	g := newGateway(t, addr, up.URL)
 	t1, _ := NewToken()
 	t2, _ := NewToken()
-	s1, _ := g.Open(t1, testID)
-	s2, _ := g.Open(t2, testID)
+	s1 := mustOpen(t, g, t1)
+	s2 := mustOpen(t, g, t2)
 	defer s2.Close()
 	r1, r2 := post(t, addr, t1), post(t, addr, t2)
 	defer r1.Body.Close()
@@ -226,7 +236,7 @@ func TestGatewayHoldsThePortOnlyWhileSessionsAreOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s2, _ := g.Open(t2, testID)
+	s2 := mustOpen(t, g, t2)
 	s1.Close()
 	if c, err := net.DialTimeout("tcp", addr, time.Second); err != nil {
 		t.Fatal("port released while a session is still open")
@@ -243,7 +253,7 @@ func TestGatewayHoldsThePortOnlyWhileSessionsAreOpen(t *testing.T) {
 	}
 	// A port someone else holds is reported, not silently shared.
 	other := newGateway(t, addr, "http://127.0.0.1:1")
-	held, _ := other.Open(t1, testID)
+	held := mustOpen(t, other, t1)
 	defer held.Close()
 	if _, err := g.Open(t2, testID); err == nil {
 		t.Error("two gateways bound one address")
@@ -474,7 +484,7 @@ func TestBindErrorKeepsBothHints(t *testing.T) {
 		t.Skip("kernel port settings unreadable here")
 	}
 	token, _ := NewToken()
-	_, err = g.Open(token, Identity{Pipeline: "p", RunID: 1})
+	_, err = g.Open(token, testID)
 	if err == nil {
 		t.Fatal("bound a held port")
 	}
